@@ -11,49 +11,39 @@ st.caption("Cruza el catálogo de Prestashop con los listings de Amazon y detect
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("📂 Cargar archivos")
-
-    ps_file      = st.file_uploader("📦 Prestashop BD (CSV semicolon)",
-                                    type=["csv","txt"], key="ps")
-    jabiru_file  = st.file_uploader("🇪🇸 Jabiru ES (listing Amazon)",
-                                    type=["txt","tsv","csv"], key="jabiru")
-    turaco_file  = st.file_uploader("🇪🇸 Turaco ES (listing Amazon)",
-                                    type=["txt","tsv","csv"], key="turaco")
-    de_file      = st.file_uploader("🇩🇪 DE (listing Amazon)",
-                                    type=["txt","tsv","csv"], key="de")
-    fr_file      = st.file_uploader("🇫🇷 FR (listing Amazon)",
-                                    type=["txt","tsv","csv"], key="fr")
-    it_file      = st.file_uploader("🇮🇹 IT (listing Amazon)",
-                                    type=["txt","tsv","csv"], key="it")
+    ps_file     = st.file_uploader("📦 Prestashop BD (CSV semicolon)",    type=["csv","txt"], key="ps")
+    jabiru_file = st.file_uploader("🇪🇸 Jabiru ES (listing Amazon)",       type=["txt","tsv","csv"], key="jabiru")
+    turaco_file = st.file_uploader("🇪🇸 Turaco ES (listing Amazon)",       type=["txt","tsv","csv"], key="turaco")
+    de_file     = st.file_uploader("🇩🇪 DE (listing Amazon)",              type=["txt","tsv","csv"], key="de")
+    fr_file     = st.file_uploader("🇫🇷 FR (listing Amazon)",              type=["txt","tsv","csv"], key="fr")
+    it_file     = st.file_uploader("🇮🇹 IT (listing Amazon)",              type=["txt","tsv","csv"], key="it")
 
     st.divider()
     st.markdown("""
 **Lógica de validación (solo SKUs Active):**
-- 🇪🇸 **ES**: busca `SKU` y `S+SKU`
-- 🇫🇷 **FR**: busca `SKU`, `S+SKU` y `FR+SKU`
-- 🇮🇹 **IT**: busca `SKU`, `S+SKU` y `IT+SKU`
-- 🇩🇪 **DE**: busca `SKU`, `S+SKU` y `DE+SKU`
+
+**Cruce 1 – Faltantes por país**
+- 🇪🇸 Jabiru ES: refs PS sin listing activo
+- 🇪🇸 Turaco ES: bases de Jabiru sin variante en Turaco
+- 🇫🇷/🇮🇹/🇩🇪: bases de Jabiru sin variante activa en ese país
+
+**Cruce 2 – Espejos S+SKU faltantes**
+- Cada SKU base debe tener su `S+SKU` en ES (Jabiru y Turaco) y en FR, IT, DE
 """)
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def read_ps(f) -> pd.Series:
-    """Read Prestashop CSV (semicolon) and return Series of reference strings."""
     df = pd.read_csv(f, sep=";", dtype=str, low_memory=False)
     col = next((c for c in df.columns if c.strip().lower() == "reference"), None)
     if col is None:
         st.error("❌ No se encontró columna 'reference' en el CSV de Prestashop.")
         return pd.Series(dtype=str)
     refs = df[col].dropna().str.strip()
-    refs = refs[refs != ""]
-    return refs
+    return refs[refs != ""]
 
 
 def read_listing(f, label: str) -> pd.DataFrame:
-    """
-    Read an Amazon listing TSV.
-    Returns DataFrame with normalised columns: sku (str), asin (str).
-    Only rows with status == 'Active' are kept.
-    """
     try:
         df = pd.read_csv(f, sep="\t", dtype=str, low_memory=False,
                          encoding="utf-8-sig", on_bad_lines="skip")
@@ -61,334 +51,339 @@ def read_listing(f, label: str) -> pd.DataFrame:
         st.error(f"❌ Error leyendo {label}: {e}")
         return pd.DataFrame(columns=["sku", "asin"])
 
-    # Filter to Active only (column 'status' present in all listing files)
     status_col = next((c for c in df.columns if c.strip().lower() == "status"), None)
     total_rows = len(df)
     if status_col:
         df = df[df[status_col].str.strip().str.lower() == "active"].copy()
-        active_rows = len(df)
-    else:
-        active_rows = total_rows  # no status column, keep all
+    active_rows = len(df)
 
-    # Detect SKU column (col A) and ASIN column (col B)
     sku_col  = df.columns[0]
     asin_col = df.columns[1] if len(df.columns) > 1 else None
-
     df = df[[sku_col, asin_col]].copy() if asin_col else df[[sku_col]].copy()
     df.columns = ["sku", "asin"] if asin_col else ["sku"]
-    df["sku"]  = df["sku"].astype(str).str.strip()
-    if "asin" in df.columns:
-        df["asin"] = df["asin"].astype(str).str.strip()
-    else:
+    df["sku"] = df["sku"].astype(str).str.strip().str.upper()
+    if "asin" not in df.columns:
         df["asin"] = ""
+    else:
+        df["asin"] = df["asin"].astype(str).str.strip()
 
     df = df[df["sku"].notna() & (df["sku"] != "") & (df["sku"] != "nan")]
-
-    # Store stats as attributes for display in sidebar
     df.attrs["label"]       = label
     df.attrs["total_rows"]  = total_rows
     df.attrs["active_rows"] = active_rows
-
     return df
-
-
-def sku_set(df: pd.DataFrame) -> set:
-    return set(df["sku"].str.upper().dropna())
-
-
-def sku_asin_map(df: pd.DataFrame) -> dict:
-    """Devuelve dict {sku_upper: asin} (primer ASIN encontrado)."""
-    return (df.drop_duplicates("sku")
-              .set_index(df["sku"].str.upper())["asin"]
-              .to_dict())
 
 
 def extract_base(ref: str) -> str:
     """
-    Extrae la BASE del SKU de una referencia PS, eliminando el prefijo de país/variante.
-
-    Tipos de referencia:
-      Simple numérico : '01696'             -> '01696'
-      S-prefix        : 'S05802'            -> '05802'
-      País+numérico   : 'DE01180'           -> '01180'
-      Con guión bajo  : 'P82_EU01_115591'   -> 'P82_EU01_115591'
-      País+guión bajo : 'DEP82_EU01_115716' -> 'P82_EU01_115716'
-                        'SA01_EU01_119670'  -> 'A01_EU01_119670'
-      Alfanumérico    : 'V0331'             -> 'V0331'
-      País+alfanum    : 'DEV0331'           -> 'V0331'
-      Con punto final : '05152.'            -> '05152'
+    Extrae la BASE del SKU eliminando prefijo de país/variante.
+      P82_EU01_115591   -> P82_EU01_115591
+      DEP82_EU01_115716 -> P82_EU01_115716
+      SA01_EU01_119670  -> A01_EU01_119670
+      DE01180           -> 01180
+      S05802            -> 05802
+      DEV0331           -> V0331
+      05152.            -> 05152
     """
     ref = ref.strip().rstrip(".")
-
     if "_" in ref:
-        # Refs con guión bajo: el modelo empieza por letra+2dígitos+_ (ej. A01_, P82_)
-        # El prefijo de país precede al modelo: SA01_, DEP82_, FRA01_...
         m = re.search(r"([A-Z]\d{2}_)", ref.upper())
         if m:
-            return ref[m.start():]      # devolver desde donde empieza el modelo
-        return ref                      # fallback
-
-    # Sin guión bajo: quitar prefijo DE|FR|IT|S si existe
+            return ref[m.start():]
+        return ref
     m = re.match(r"^(DE|FR|IT|S)([A-Z]?\d+.*)$", ref, re.IGNORECASE)
     if m:
         rest = m.group(2)
-        if re.match(r"^\d+$", rest):    # puro numérico -> zero-pad a 5
-            return rest.zfill(5)
-        return rest                     # alfanumérico tipo V0331
-
-    # Puro numérico sin prefijo
+        return rest.zfill(5) if re.match(r"^\d+$", rest) else rest
     if re.match(r"^\d+$", ref):
         return ref.zfill(5)
+    return ref
 
-    return ref                          # fallback: tal cual
 
-
-def build_variants(ref: str, country_prefix: str = "") -> list:
-    """
-    Construye las variantes de búsqueda para un ref PS dado.
-
-    Para ES:       base, S+base
-    Para FR/IT/DE: base, S+base, PREFIX+base
-    """
-    base = extract_base(ref)
-    variants = [base, f"S{base}"]
-    if country_prefix:
-        variants.append(f"{country_prefix}{base}")
-    return variants
+def build_sku_map(df: pd.DataFrame) -> dict:
+    """dict {sku_upper -> asin}"""
+    return df.drop_duplicates("sku").set_index("sku")["asin"].to_dict()
 
 
 def jabiru_bases_map(jabiru_df: pd.DataFrame) -> dict:
-    """
-    Construye un dict {base_upper -> (sku_jabiru, asin)} a partir de los SKUs
-    activos de Jabiru ES. La base es el núcleo sin prefijo de país.
-    """
+    """dict {base_upper -> (sku_jabiru, asin)}  — primer SKU encontrado por base."""
     result = {}
     for _, row in jabiru_df.iterrows():
-        sku  = row["sku"]                       # ya está en upper
-        base = extract_base(sku).upper()
-        if base not in result:                  # primer SKU encontrado gana
-            result[base] = (sku, row["asin"])
+        base = extract_base(row["sku"]).upper()
+        if base not in result:
+            result[base] = (row["sku"], row["asin"])
     return result
 
 
-def check_country(jabiru_bases: dict,
-                  listing_skus: set,
-                  country_prefix: str = "") -> pd.DataFrame:
-    """
-    Para cada base activa de Jabiru ES, comprueba si existe alguna variante
-    en el listing del país. Devuelve los que FALTAN.
+# ── Cruce 1: faltantes por país ───────────────────────────────────────────────
 
-    Para ES (Jabiru):   base, S+base
-    Para FR/IT/DE:      base, S+base, PREFIX+base
-    """
-    rows = []
-    for base, (sku_jabiru, asin) in jabiru_bases.items():
-        variants = [base, f"S{base}"]
-        if country_prefix:
-            variants.append(f"{country_prefix}{base}")
-        if not any(v in listing_skus for v in variants):
-            rows.append({
-                "SKU Jabiru ES":      sku_jabiru,
-                "Base SKU":           base,
-                "ASIN":               asin,
-                "Variantes buscadas": " | ".join(variants),
-            })
-    return pd.DataFrame(rows)
-
-
-def check_turaco(jabiru_bases: dict,
-                 turaco_skus: set) -> pd.DataFrame:
-    """
-    Turaco ES debe tener los mismos SKUs activos que Jabiru ES.
-    """
-    rows = []
-    for base, (sku_jabiru, asin) in jabiru_bases.items():
-        variants = [base, f"S{base}"]
-        if not any(v in turaco_skus for v in variants):
-            rows.append({
-                "SKU Jabiru ES": sku_jabiru,
-                "Base SKU":      base,
-                "ASIN":          asin,
-            })
-    return pd.DataFrame(rows)
-
-
-def check_jabiru_vs_ps(refs: pd.Series,
-                       jabiru_skus: set,
-                       jabiru_map: dict) -> pd.DataFrame:
-    """
-    Referencias PS que no tienen ninguna variante activa en Jabiru ES.
-    Estos son los SKUs que faltaría crear/activar primero en Jabiru.
-    """
+def check_jabiru_vs_ps(refs: pd.Series, jabiru_skus: set) -> pd.DataFrame:
+    """Refs PS sin ninguna variante activa en Jabiru ES."""
     rows = []
     for ref in refs:
-        base     = extract_base(ref).upper()
-        variants = [base, f"S{base}"]
-        if not any(v in jabiru_skus for v in variants):
-            rows.append({
-                "SKU (ref PS)":       ref,
-                "Base SKU":           base,
-                "Variantes buscadas": " | ".join(variants),
-            })
+        base = extract_base(ref).upper()
+        if not any(v in jabiru_skus for v in [base, f"S{base}"]):
+            rows.append({"SKU (ref PS)": ref, "Base SKU": base,
+                         "Variantes buscadas": f"{base} | S{base}"})
     return pd.DataFrame(rows)
+
+
+def check_turaco(j_bases: dict, turaco_skus: set) -> pd.DataFrame:
+    """Bases activas de Jabiru sin ninguna variante en Turaco."""
+    rows = []
+    for base, (sku_j, asin) in j_bases.items():
+        if not any(v in turaco_skus for v in [base, f"S{base}"]):
+            rows.append({"SKU Jabiru ES": sku_j, "Base SKU": base, "ASIN": asin,
+                         "Variantes buscadas": f"{base} | S{base}"})
+    return pd.DataFrame(rows)
+
+
+def check_country(j_bases: dict, listing_skus: set, country_prefix: str) -> pd.DataFrame:
+    """Bases activas de Jabiru sin ninguna variante activa en el país."""
+    rows = []
+    for base, (sku_j, asin) in j_bases.items():
+        variants = [base, f"S{base}", f"{country_prefix}{base}"]
+        if not any(v in listing_skus for v in variants):
+            rows.append({"SKU Jabiru ES": sku_j, "Base SKU": base, "ASIN": asin,
+                         "Variantes buscadas": " | ".join(variants)})
+    return pd.DataFrame(rows)
+
+
+# ── Cruce 2: espejos S+SKU faltantes ─────────────────────────────────────────
+
+def check_mirror(j_bases: dict,
+                 listing_skus: set,
+                 listing_map: dict,
+                 store_label: str) -> pd.DataFrame:
+    """
+    Para cada base activa de Jabiru, verifica que S+base exista en el listing.
+    Devuelve filas donde S+base falta.
+    """
+    rows = []
+    for base, (sku_j, asin_base) in j_bases.items():
+        s_sku = f"S{base}"
+        if s_sku not in listing_skus:
+            rows.append({
+                "Tienda":        store_label,
+                "SKU Jabiru ES": sku_j,
+                "Base SKU":      base,
+                "SKU espejo":    s_sku,
+                "ASIN base":     asin_base,
+                "ASIN espejo":   listing_map.get(s_sku, ""),
+            })
     return pd.DataFrame(rows)
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 files_ready = all([ps_file, jabiru_file, turaco_file, de_file, fr_file, it_file])
-
 if not files_ready:
     st.info("👈 Carga todos los archivos en el panel izquierdo para comenzar el análisis.")
     st.stop()
 
 with st.spinner("Cargando y procesando archivos…"):
-    refs      = read_ps(ps_file)
-    jabiru    = read_listing(jabiru_file,  "Jabiru ES")
-    turaco    = read_listing(turaco_file,  "Turaco ES")
-    de        = read_listing(de_file,      "DE")
-    fr        = read_listing(fr_file,      "FR")
-    it        = read_listing(it_file,      "IT")
+    refs   = read_ps(ps_file)
+    jabiru = read_listing(jabiru_file, "Jabiru ES")
+    turaco = read_listing(turaco_file, "Turaco ES")
+    de     = read_listing(de_file,     "DE")
+    fr     = read_listing(fr_file,     "FR")
+    it     = read_listing(it_file,     "IT")
 
-# Show active/total stats per listing in sidebar
 with st.sidebar:
     st.divider()
     st.markdown("**📊 SKUs activos por listing:**")
-    for df, flag in [(jabiru, "🇪🇸 Jabiru"), (turaco, "🇪🇸 Turaco"),
-                     (fr, "🇫🇷 FR"), (it, "🇮🇹 IT"), (de, "🇩🇪 DE")]:
-        total  = df.attrs.get("total_rows", "?")
-        active = df.attrs.get("active_rows", len(df))
+    for _df, flag in [(jabiru,"🇪🇸 Jabiru"),(turaco,"🇪🇸 Turaco"),
+                      (fr,"🇫🇷 FR"),(it,"🇮🇹 IT"),(de,"🇩🇪 DE")]:
+        total  = _df.attrs.get("total_rows", "?")
+        active = _df.attrs.get("active_rows", len(_df))
         pct    = f"{active/total*100:.0f}%" if isinstance(total, int) and total > 0 else "?"
         st.caption(f"{flag}: **{active:,}** activos / {total:,} total ({pct})")
 
 with st.spinner("Calculando cruces…"):
+    jabiru_skus = set(jabiru["sku"])
+    turaco_skus = set(turaco["sku"])
+    fr_skus     = set(fr["sku"])
+    it_skus     = set(it["sku"])
+    de_skus     = set(de["sku"])
 
-    jabiru_skus  = sku_set(jabiru)
-    turaco_skus  = sku_set(turaco)
-    de_skus      = sku_set(de)
-    fr_skus      = sku_set(fr)
-    it_skus      = sku_set(it)
+    jabiru_map = build_sku_map(jabiru)
+    turaco_map = build_sku_map(turaco)
+    fr_map     = build_sku_map(fr)
+    it_map     = build_sku_map(it)
+    de_map     = build_sku_map(de)
 
-    jabiru_map   = sku_asin_map(jabiru)
-
-    # Base única de cada SKU activo de Jabiru -> fuente de verdad para cruces
+    # Fuente de verdad: bases únicas activas de Jabiru
     j_bases = jabiru_bases_map(jabiru)
 
-    # ── 1) Referencias PS sin presencia activa en Jabiru ES ───────────────────
-    df_es_missing = check_jabiru_vs_ps(refs, jabiru_skus, jabiru_map)
-
-    # ── 2) Jabiru ES vs Turaco ES ─────────────────────────────────────────────
+    # ── Cruce 1: faltantes ────────────────────────────────────────────────────
+    df_ps_vs_jabiru   = check_jabiru_vs_ps(refs, jabiru_skus)
     df_turaco_missing = check_turaco(j_bases, turaco_skus)
+    df_fr_missing     = check_country(j_bases, fr_skus,  "FR")
+    df_it_missing     = check_country(j_bases, it_skus,  "IT")
+    df_de_missing     = check_country(j_bases, de_skus,  "DE")
 
-    # ── 3) Jabiru ES vs países internacionales ────────────────────────────────
-    df_fr_missing = check_country(j_bases, fr_skus, country_prefix="FR")
-    df_it_missing = check_country(j_bases, it_skus, country_prefix="IT")
-    df_de_missing = check_country(j_bases, de_skus, country_prefix="DE")
+    # ── Cruce 2: espejos S+SKU ────────────────────────────────────────────────
+    df_mirror_jabiru  = check_mirror(j_bases, jabiru_skus, jabiru_map, "Jabiru ES")
+    df_mirror_turaco  = check_mirror(j_bases, turaco_skus, turaco_map, "Turaco ES")
+    df_mirror_fr      = check_mirror(j_bases, fr_skus,     fr_map,     "FR")
+    df_mirror_it      = check_mirror(j_bases, it_skus,     it_map,     "IT")
+    df_mirror_de      = check_mirror(j_bases, de_skus,     de_map,     "DE")
+
+    # Resumen unificado de espejos (todas las tiendas)
+    df_mirror_all = pd.concat(
+        [df_mirror_jabiru, df_mirror_turaco, df_mirror_fr, df_mirror_it, df_mirror_de],
+        ignore_index=True
+    )
 
 # ─── KPI summary ──────────────────────────────────────────────────────────────
 st.subheader("📊 Resumen")
+
+st.markdown("**Cruce 1 – SKUs faltantes por país**")
 c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("Referencias PS",          len(refs))
-c2.metric("❌ Sin listing en Jabiru", len(df_es_missing))
-c3.metric("❌ Turaco ES faltante",    len(df_turaco_missing))
-c4.metric("❌ FR faltante",           len(df_fr_missing))
-c5.metric("❌ IT faltante",           len(df_it_missing))
-c6.metric("❌ DE faltante",           len(df_de_missing))
+c1.metric("Referencias PS",           len(refs))
+c2.metric("❌ Sin listing Jabiru",     len(df_ps_vs_jabiru))
+c3.metric("❌ Turaco ES faltante",     len(df_turaco_missing))
+c4.metric("❌ FR faltante",            len(df_fr_missing))
+c5.metric("❌ IT faltante",            len(df_it_missing))
+c6.metric("❌ DE faltante",            len(df_de_missing))
+
+st.markdown("**Cruce 2 – Espejos S+SKU faltantes**")
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("🪞 Jabiru ES", len(df_mirror_jabiru))
+m2.metric("🪞 Turaco ES", len(df_mirror_turaco))
+m3.metric("🪞 FR",        len(df_mirror_fr))
+m4.metric("🪞 IT",        len(df_mirror_it))
+m5.metric("🪞 DE",        len(df_mirror_de))
 
 st.divider()
 
 # ─── Tabs ─────────────────────────────────────────────────────────────────────
-tab_turaco, tab_es, tab_fr, tab_it, tab_de, tab_export = st.tabs([
-    "🇪🇸 Turaco ES", "🇪🇸 Jabiru ES", "🇫🇷 FR", "🇮🇹 IT", "🇩🇪 DE", "📥 Exportar todo"])
+(tab_ps, tab_turaco, tab_fr, tab_it, tab_de,
+ tab_mirror, tab_export) = st.tabs([
+    "🇪🇸 Jabiru ES", "🇪🇸 Turaco ES", "🇫🇷 FR", "🇮🇹 IT", "🇩🇪 DE",
+    "🪞 Espejos S+SKU", "📥 Exportar todo"])
 
 
-def show_tab(df: pd.DataFrame, title: str, sku_col: str, asin_col: str):
-    st.markdown(f"### {title}")
+def show_table(df: pd.DataFrame, label_empty: str = "✅ Sin SKUs pendientes.",
+               search_cols: list = None, dl_key: str = "", dl_name: str = "export.csv"):
     if df.empty:
-        st.success("✅ Sin SKUs pendientes de crear.")
-    else:
-        st.warning(f"⚠️ **{len(df)} SKUs** pendientes de crear.")
-        # search filter
-        q = st.text_input("🔍 Filtrar SKU/ASIN", key=title)
-        filtered = df
-        if q:
-            mask = df[sku_col].str.contains(q, case=False, na=False)
-            if asin_col in df.columns:
-                mask |= df[asin_col].str.contains(q, case=False, na=False)
-            filtered = df[mask]
-        st.dataframe(filtered, use_container_width=True, height=420)
+        st.success(label_empty)
+        return
+    st.warning(f"⚠️ **{len(df):,} SKUs** pendientes.")
+    q = st.text_input("🔍 Filtrar", key=f"q_{dl_key}")
+    filtered = df
+    if q:
+        cols = search_cols or list(df.columns)
+        mask = pd.Series(False, index=df.index)
+        for c in cols:
+            if c in df.columns:
+                mask |= df[c].astype(str).str.contains(q, case=False, na=False)
+        filtered = df[mask]
+    st.dataframe(filtered, use_container_width=True, height=420)
+    csv = filtered.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(f"⬇️ Descargar CSV", data=csv,
+                       file_name=dl_name, mime="text/csv", key=f"dl_{dl_key}")
 
-        # Download
-        out_df = filtered[[sku_col, asin_col]].copy() if asin_col in filtered.columns else filtered[[sku_col]].copy()
-        csv_bytes = out_df.to_csv(index=False).encode("utf-8-sig")
-        slug = title.replace(" ", "_").replace("🇪🇸","ES").replace("🇫🇷","FR").replace("🇮🇹","IT").replace("🇩🇪","DE")
-        st.download_button(f"⬇️ Descargar CSV – {title}",
-                           data=csv_bytes,
-                           file_name=f"skus_crear_{slug}.csv",
-                           mime="text/csv",
-                           key=f"dl_{title}")
 
+# ── Cruce 1 tabs ──────────────────────────────────────────────────────────────
+with tab_ps:
+    st.markdown("### 🇪🇸 Jabiru ES – Referencias PS sin listing activo")
+    show_table(df_ps_vs_jabiru,
+               search_cols=["SKU (ref PS)", "Base SKU"],
+               dl_key="ps_jabiru", dl_name="jabiru_ES_faltante.csv")
 
 with tab_turaco:
-    show_tab(df_turaco_missing,
-             "SKUs activos en Jabiru ES que faltan en Turaco ES",
-             "SKU Jabiru ES", "ASIN")
-
-with tab_es:
-    show_tab(df_es_missing,
-             "Referencias PS sin listing activo en Jabiru ES",
-             "SKU (ref PS)", "Base SKU")
+    st.markdown("### 🇪🇸 Turaco ES – Bases de Jabiru sin variante activa en Turaco")
+    show_table(df_turaco_missing,
+               search_cols=["SKU Jabiru ES", "Base SKU", "ASIN"],
+               dl_key="turaco", dl_name="turaco_ES_faltante.csv")
 
 with tab_fr:
-    show_tab(df_fr_missing,
-             "SKUs activos de Jabiru ES sin variante activa en FR",
-             "SKU Jabiru ES", "ASIN")
+    st.markdown("### 🇫🇷 FR – Bases de Jabiru sin variante activa en FR")
+    show_table(df_fr_missing,
+               search_cols=["SKU Jabiru ES", "Base SKU", "ASIN"],
+               dl_key="fr", dl_name="FR_faltante.csv")
 
 with tab_it:
-    show_tab(df_it_missing,
-             "SKUs activos de Jabiru ES sin variante activa en IT",
-             "SKU Jabiru ES", "ASIN")
+    st.markdown("### 🇮🇹 IT – Bases de Jabiru sin variante activa en IT")
+    show_table(df_it_missing,
+               search_cols=["SKU Jabiru ES", "Base SKU", "ASIN"],
+               dl_key="it", dl_name="IT_faltante.csv")
 
 with tab_de:
-    show_tab(df_de_missing,
-             "SKUs activos de Jabiru ES sin variante activa en DE",
-             "SKU Jabiru ES", "ASIN")
+    st.markdown("### 🇩🇪 DE – Bases de Jabiru sin variante activa en DE")
+    show_table(df_de_missing,
+               search_cols=["SKU Jabiru ES", "Base SKU", "ASIN"],
+               dl_key="de", dl_name="DE_faltante.csv")
 
+# ── Cruce 2: espejos ──────────────────────────────────────────────────────────
+with tab_mirror:
+    st.markdown("### 🪞 Espejos S+SKU faltantes")
+    st.info("Cada SKU base activo de Jabiru debe tener su `S+SKU` en ES (Jabiru y Turaco) y en FR, IT, DE.")
+
+    subtab_all, subtab_j, subtab_t, subtab_fr2, subtab_it2, subtab_de2 = st.tabs([
+        "Todas las tiendas", "Jabiru ES", "Turaco ES", "FR", "IT", "DE"])
+
+    with subtab_all:
+        st.markdown("#### Resumen unificado por tienda")
+        if df_mirror_all.empty:
+            st.success("✅ Todos los espejos S+SKU existen en todas las tiendas.")
+        else:
+            pivot = (df_mirror_all.groupby("Tienda")
+                     .size().reset_index(name="S+SKU faltantes"))
+            st.dataframe(pivot, use_container_width=True, hide_index=True)
+            st.markdown("#### Detalle completo")
+            show_table(df_mirror_all,
+                       search_cols=["Tienda", "SKU Jabiru ES", "Base SKU", "SKU espejo", "ASIN base"],
+                       dl_key="mirror_all", dl_name="espejos_S_SKU_todos.csv")
+
+    for subtab, df_m, label, dk in [
+        (subtab_j,   df_mirror_jabiru, "Jabiru ES", "mirror_jabiru"),
+        (subtab_t,   df_mirror_turaco, "Turaco ES", "mirror_turaco"),
+        (subtab_fr2, df_mirror_fr,     "FR",        "mirror_fr"),
+        (subtab_it2, df_mirror_it,     "IT",        "mirror_it"),
+        (subtab_de2, df_mirror_de,     "DE",        "mirror_de"),
+    ]:
+        with subtab:
+            st.markdown(f"#### S+SKU faltantes en {label}")
+            show_table(df_m,
+                       search_cols=["SKU Jabiru ES", "Base SKU", "SKU espejo", "ASIN base"],
+                       dl_key=dk, dl_name=f"espejos_{dk}.csv")
+
+# ── Exportar todo ─────────────────────────────────────────────────────────────
 with tab_export:
     st.markdown("### 📥 Exportar todos los resultados en un solo Excel")
 
-    def to_sheet(df: pd.DataFrame, sku_col: str, asin_col: str) -> pd.DataFrame:
-        cols = [sku_col, asin_col] if asin_col in df.columns else [sku_col]
-        return df[cols].copy()
-
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        # Tab Jabiru ES: refs PS sin listing activo
-        df_es_missing[["SKU (ref PS)", "Base SKU"]].to_excel(
-            writer, sheet_name="Jabiru_ES_faltante", index=False)
-        # Turaco, FR, IT, DE: SKU Jabiru + ASIN + variantes
-        for df_out, sheet in [
-            (df_turaco_missing, "Turaco_ES"),
-            (df_fr_missing,     "FR"),
-            (df_it_missing,     "IT"),
-            (df_de_missing,     "DE"),
-        ]:
-            cols = [c for c in ["SKU Jabiru ES", "Base SKU", "ASIN", "Variantes buscadas"] if c in df_out.columns]
-            df_out[cols].to_excel(writer, sheet_name=sheet, index=False)
+        # Cruce 1
+        df_ps_vs_jabiru.to_excel(writer,   sheet_name="C1_Jabiru_ES_faltante",  index=False)
+        df_turaco_missing.to_excel(writer,  sheet_name="C1_Turaco_ES",           index=False)
+        df_fr_missing.to_excel(writer,      sheet_name="C1_FR",                  index=False)
+        df_it_missing.to_excel(writer,      sheet_name="C1_IT",                  index=False)
+        df_de_missing.to_excel(writer,      sheet_name="C1_DE",                  index=False)
+        # Cruce 2
+        df_mirror_all.to_excel(writer,      sheet_name="C2_Espejos_todos",       index=False)
+        df_mirror_jabiru.to_excel(writer,   sheet_name="C2_Espejos_Jabiru_ES",   index=False)
+        df_mirror_turaco.to_excel(writer,   sheet_name="C2_Espejos_Turaco_ES",   index=False)
+        df_mirror_fr.to_excel(writer,       sheet_name="C2_Espejos_FR",          index=False)
+        df_mirror_it.to_excel(writer,       sheet_name="C2_Espejos_IT",          index=False)
+        df_mirror_de.to_excel(writer,       sheet_name="C2_Espejos_DE",          index=False)
 
     st.download_button(
-        "⬇️ Descargar Excel completo (todas las pestañas)",
+        "⬇️ Descargar Excel completo (11 pestañas)",
         data=buf.getvalue(),
-        file_name="skus_a_crear_todos_paises.xlsx",
+        file_name="sku_crossref_completo.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     st.markdown("""
-**Contenido del Excel:**
 | Pestaña | Descripción |
 |---|---|
-| `Turaco_ES` | SKUs de Jabiru ES que faltan en Turaco ES |
-| `Jabiru_ES` | Referencias PS sin listing en Amazon ES |
-| `FR` | Referencias PS sin ninguna variante en Amazon FR |
-| `IT` | Referencias PS sin ninguna variante en Amazon IT |
-| `DE` | Referencias PS sin ninguna variante en Amazon DE |
+| `C1_Jabiru_ES_faltante` | Refs PS sin listing activo en Jabiru |
+| `C1_Turaco_ES` | Bases Jabiru sin variante activa en Turaco |
+| `C1_FR / IT / DE` | Bases Jabiru sin variante activa en cada país |
+| `C2_Espejos_todos` | S+SKU faltantes en todas las tiendas (unificado) |
+| `C2_Espejos_Jabiru_ES` | S+SKU faltantes en Jabiru ES |
+| `C2_Espejos_Turaco_ES` | S+SKU faltantes en Turaco ES |
+| `C2_Espejos_FR / IT / DE` | S+SKU faltantes en cada país |
 """)
