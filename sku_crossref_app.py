@@ -23,7 +23,7 @@ with st.sidebar:
 **Lógica de validación (solo SKUs Active):**
 
 **Cruce 1 – Faltantes por país**
-- 🇪🇸 Jabiru ES: refs PS sin listing activo
+- 🇪🇸 Jabiru ES: SKUs activos sin referencia en PS
 - 🇪🇸 Turaco ES: bases de Jabiru sin variante en Turaco
 - 🇫🇷/🇮🇹/🇩🇪: bases de Jabiru sin variante activa en ese país
 
@@ -117,14 +117,14 @@ def jabiru_bases_map(jabiru_df: pd.DataFrame) -> dict:
 
 # ── Cruce 1: faltantes por país ───────────────────────────────────────────────
 
-def check_jabiru_vs_ps(refs: pd.Series, jabiru_skus: set) -> pd.DataFrame:
-    """Refs PS sin ninguna variante activa en Jabiru ES."""
+def check_jabiru_vs_ps(jabiru_df: pd.DataFrame, refs: pd.Series) -> pd.DataFrame:
+    """SKUs activos de Jabiru cuya base NO existe en las referencias de Prestashop."""
+    ps_bases = set(extract_base(r).upper() for r in refs)
     rows = []
-    for ref in refs:
-        base = extract_base(ref).upper()
-        if not any(v in jabiru_skus for v in [base, f"S{base}"]):
-            rows.append({"SKU (ref PS)": ref, "Base SKU": base,
-                         "Variantes buscadas": f"{base} | S{base}"})
+    for _, row in jabiru_df.iterrows():
+        base = extract_base(row["sku"]).upper()
+        if base not in ps_bases:
+            rows.append({"SKU Jabiru ES": row["sku"], "Base SKU": base, "ASIN": row["asin"]})
     return pd.DataFrame(rows)
 
 
@@ -216,7 +216,7 @@ with st.spinner("Calculando cruces…"):
     j_bases = jabiru_bases_map(jabiru)
 
     # ── Cruce 1: faltantes ────────────────────────────────────────────────────
-    df_ps_vs_jabiru   = check_jabiru_vs_ps(refs, jabiru_skus)
+    df_ps_vs_jabiru   = check_jabiru_vs_ps(jabiru, refs)
     df_turaco_missing = check_turaco(j_bases, turaco_skus)
     df_fr_missing     = check_country(j_bases, fr_skus,  "FR")
     df_it_missing     = check_country(j_bases, it_skus,  "IT")
@@ -241,7 +241,7 @@ st.subheader("📊 Resumen")
 st.markdown("**Cruce 1 – SKUs faltantes por país**")
 c1, c2, c3, c4, c5, c6 = st.columns(6)
 c1.metric("Referencias PS",           len(refs))
-c2.metric("❌ Sin listing Jabiru",     len(df_ps_vs_jabiru))
+c2.metric("❌ Jabiru sin ref en PS",    len(df_ps_vs_jabiru))
 c3.metric("❌ Turaco ES faltante",     len(df_turaco_missing))
 c4.metric("❌ FR faltante",            len(df_fr_missing))
 c5.metric("❌ IT faltante",            len(df_it_missing))
@@ -287,7 +287,7 @@ def show_table(df: pd.DataFrame, label_empty: str = "✅ Sin SKUs pendientes.",
 
 # ── Cruce 1 tabs ──────────────────────────────────────────────────────────────
 with tab_ps:
-    st.markdown("### 🇪🇸 Jabiru ES – Referencias PS sin listing activo")
+    st.markdown("### 🇪🇸 Jabiru ES – SKUs activos sin referencia en Prestashop")
     show_table(df_ps_vs_jabiru,
                search_cols=["SKU (ref PS)", "Base SKU"],
                dl_key="ps_jabiru", dl_name="jabiru_ES_faltante.csv")
@@ -379,7 +379,7 @@ with tab_export:
     st.markdown("""
 | Pestaña | Descripción |
 |---|---|
-| `C1_Jabiru_ES_faltante` | Refs PS sin listing activo en Jabiru |
+| `C1_Jabiru_ES_faltante` | SKUs activos de Jabiru sin referencia en PS |
 | `C1_Turaco_ES` | Bases Jabiru sin variante activa en Turaco |
 | `C1_FR / IT / DE` | Bases Jabiru sin variante activa en cada país |
 | `C2_Espejos_todos` | S+SKU faltantes en todas las tiendas (unificado) |
