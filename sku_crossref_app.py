@@ -27,7 +27,7 @@ with st.sidebar:
 
     st.divider()
     st.markdown("""
-**Lógica de validación:**
+**Lógica de validación (solo SKUs Active):**
 - 🇪🇸 **ES**: busca `SKU` y `S+SKU`
 - 🇫🇷 **FR**: busca `SKU`, `S+SKU` y `FR+SKU`
 - 🇮🇹 **IT**: busca `SKU`, `S+SKU` y `IT+SKU`
@@ -52,6 +52,7 @@ def read_listing(f, label: str) -> pd.DataFrame:
     """
     Read an Amazon listing TSV.
     Returns DataFrame with normalised columns: sku (str), asin (str).
+    Only rows with status == 'Active' are kept.
     """
     try:
         df = pd.read_csv(f, sep="\t", dtype=str, low_memory=False,
@@ -59,6 +60,15 @@ def read_listing(f, label: str) -> pd.DataFrame:
     except Exception as e:
         st.error(f"❌ Error leyendo {label}: {e}")
         return pd.DataFrame(columns=["sku", "asin"])
+
+    # Filter to Active only (column 'status' present in all listing files)
+    status_col = next((c for c in df.columns if c.strip().lower() == "status"), None)
+    total_rows = len(df)
+    if status_col:
+        df = df[df[status_col].str.strip().str.lower() == "active"].copy()
+        active_rows = len(df)
+    else:
+        active_rows = total_rows  # no status column, keep all
 
     # Detect SKU column (col A) and ASIN column (col B)
     sku_col  = df.columns[0]
@@ -73,6 +83,12 @@ def read_listing(f, label: str) -> pd.DataFrame:
         df["asin"] = ""
 
     df = df[df["sku"].notna() & (df["sku"] != "") & (df["sku"] != "nan")]
+
+    # Store stats as attributes for display in sidebar
+    df.attrs["label"]       = label
+    df.attrs["total_rows"]  = total_rows
+    df.attrs["active_rows"] = active_rows
+
     return df
 
 
@@ -202,6 +218,19 @@ with st.spinner("Cargando y procesando archivos…"):
     de        = read_listing(de_file,      "DE")
     fr        = read_listing(fr_file,      "FR")
     it        = read_listing(it_file,      "IT")
+
+# Show active/total stats per listing in sidebar
+with st.sidebar:
+    st.divider()
+    st.markdown("**📊 SKUs activos por listing:**")
+    for df, flag in [(jabiru, "🇪🇸 Jabiru"), (turaco, "🇪🇸 Turaco"),
+                     (fr, "🇫🇷 FR"), (it, "🇮🇹 IT"), (de, "🇩🇪 DE")]:
+        total  = df.attrs.get("total_rows", "?")
+        active = df.attrs.get("active_rows", len(df))
+        pct    = f"{active/total*100:.0f}%" if isinstance(total, int) and total > 0 else "?"
+        st.caption(f"{flag}: **{active:,}** activos / {total:,} total ({pct})")
+
+with st.spinner("Calculando cruces…"):
 
     jabiru_skus  = sku_set(jabiru)
     turaco_skus  = sku_set(turaco)
