@@ -87,38 +87,57 @@ def sku_asin_map(df: pd.DataFrame) -> dict:
               .to_dict())
 
 
-def extract_numeric_core(ref: str) -> str:
+def extract_base(ref: str) -> str:
     """
-    Extrae el núcleo numérico de una referencia PS y lo zero-padea a 5 dígitos.
+    Extrae la BASE del SKU de una referencia PS, eliminando el prefijo de país/variante.
 
-    Ejemplos:
-      '01696'    -> '01696'   (ya numérico puro, 5 dígitos)
-      '1696'     -> '01696'   (numérico, padding)
-      'S05802'   -> '05802'   (quita prefijo S)
-      'DE01180'  -> '01180'   (quita prefijo DE)
-      'FR00273'  -> '00273'   (quita prefijo FR)
-      'IT04309'  -> '04309'   (quita prefijo IT)
-      '05152.'   -> '05152'   (limpia puntos/espacios)
+    Tipos de referencia:
+      Simple numérico : '01696'             -> '01696'
+      S-prefix        : 'S05802'            -> '05802'
+      País+numérico   : 'DE01180'           -> '01180'
+      Con guión bajo  : 'P82_EU01_115591'   -> 'P82_EU01_115591'
+      País+guión bajo : 'DEP82_EU01_115716' -> 'P82_EU01_115716'
+                        'SA01_EU01_119670'  -> 'A01_EU01_119670'
+      Alfanumérico    : 'V0331'             -> 'V0331'
+      País+alfanum    : 'DEV0331'           -> 'V0331'
+      Con punto final : '05152.'            -> '05152'
     """
-    ref = ref.strip().rstrip(".")           # limpiar puntos finales
-    m = re.search(r"(\d+)", ref)
-    if not m:
-        return ref                          # fallback: devolver tal cual
-    num = m.group(1)
-    return num.zfill(5)                     # zero-pad a 5 dígitos
+    ref = ref.strip().rstrip(".")
+
+    if "_" in ref:
+        # Refs con guión bajo: el modelo empieza por letra+2dígitos+_ (ej. A01_, P82_)
+        # El prefijo de país precede al modelo: SA01_, DEP82_, FRA01_...
+        m = re.search(r"([A-Z]\d{2}_)", ref.upper())
+        if m:
+            return ref[m.start():]      # devolver desde donde empieza el modelo
+        return ref                      # fallback
+
+    # Sin guión bajo: quitar prefijo DE|FR|IT|S si existe
+    m = re.match(r"^(DE|FR|IT|S)([A-Z]?\d+.*)$", ref, re.IGNORECASE)
+    if m:
+        rest = m.group(2)
+        if re.match(r"^\d+$", rest):    # puro numérico -> zero-pad a 5
+            return rest.zfill(5)
+        return rest                     # alfanumérico tipo V0331
+
+    # Puro numérico sin prefijo
+    if re.match(r"^\d+$", ref):
+        return ref.zfill(5)
+
+    return ref                          # fallback: tal cual
 
 
 def build_variants(ref: str, country_prefix: str = "") -> list:
     """
     Construye las variantes de búsqueda para un ref PS dado.
 
-    Para ES:       núm, S+núm
-    Para FR/IT/DE: núm, S+núm, PREFIX+núm
+    Para ES:       base, S+base
+    Para FR/IT/DE: base, S+base, PREFIX+base
     """
-    core = extract_numeric_core(ref)
-    variants = [core, f"S{core}"]
+    base = extract_base(ref)
+    variants = [base, f"S{base}"]
     if country_prefix:
-        variants.append(f"{country_prefix}{core}")
+        variants.append(f"{country_prefix}{base}")
     return variants
 
 
@@ -143,7 +162,7 @@ def check_country(refs: pd.Series,
                     jabiru_asin = jabiru_map[v]
                     break
             rows.append({"SKU (ref PS)": ref,
-                         "Núcleo numérico": extract_numeric_core(ref),
+                         "Base SKU": extract_base(ref),
                          "ASIN (Jabiru ES)": jabiru_asin,
                          "Variantes buscadas": " | ".join(variants)})
     return pd.DataFrame(rows)
