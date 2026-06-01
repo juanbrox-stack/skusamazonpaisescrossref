@@ -87,38 +87,63 @@ def sku_asin_map(df: pd.DataFrame) -> dict:
               .to_dict())
 
 
-def variants_es(ref: str) -> list:
-    """SKU y S+SKU para ES."""
-    return [ref, f"S{ref}"]
+def extract_numeric_core(ref: str) -> str:
+    """
+    Extrae el núcleo numérico de una referencia PS y lo zero-padea a 5 dígitos.
+
+    Ejemplos:
+      '01696'    -> '01696'   (ya numérico puro, 5 dígitos)
+      '1696'     -> '01696'   (numérico, padding)
+      'S05802'   -> '05802'   (quita prefijo S)
+      'DE01180'  -> '01180'   (quita prefijo DE)
+      'FR00273'  -> '00273'   (quita prefijo FR)
+      'IT04309'  -> '04309'   (quita prefijo IT)
+      '05152.'   -> '05152'   (limpia puntos/espacios)
+    """
+    ref = ref.strip().rstrip(".")           # limpiar puntos finales
+    m = re.search(r"(\d+)", ref)
+    if not m:
+        return ref                          # fallback: devolver tal cual
+    num = m.group(1)
+    return num.zfill(5)                     # zero-pad a 5 dígitos
 
 
-def variants_intl(ref: str, prefix: str) -> list:
-    """SKU, S+SKU y PREFIX+SKU para FR/IT/DE."""
-    return [ref, f"S{ref}", f"{prefix}{ref}"]
+def build_variants(ref: str, country_prefix: str = "") -> list:
+    """
+    Construye las variantes de búsqueda para un ref PS dado.
+
+    Para ES:       núm, S+núm
+    Para FR/IT/DE: núm, S+núm, PREFIX+núm
+    """
+    core = extract_numeric_core(ref)
+    variants = [core, f"S{core}"]
+    if country_prefix:
+        variants.append(f"{country_prefix}{core}")
+    return variants
 
 
 def check_country(refs: pd.Series,
                   listing_skus: set,
                   listing_map: dict,
                   jabiru_map: dict,
-                  get_variants_fn) -> pd.DataFrame:
+                  country_prefix: str = "") -> pd.DataFrame:
     """
     Para cada ref de PS comprueba si alguna variante existe en el listing.
     Devuelve un DataFrame con los que FALTAN.
     """
     rows = []
     for ref in refs:
-        ref_u = ref.upper()
-        variants = [v.upper() for v in get_variants_fn(ref_u)]
+        variants = [v.upper() for v in build_variants(ref, country_prefix)]
         found = any(v in listing_skus for v in variants)
         if not found:
             # Buscar ASIN en Jabiru ES como referencia
             jabiru_asin = ""
-            for v in [ref_u, f"S{ref_u}"]:
+            for v in variants[:2]:          # núm y S+núm son los de ES
                 if v in jabiru_map:
                     jabiru_asin = jabiru_map[v]
                     break
             rows.append({"SKU (ref PS)": ref,
+                         "Núcleo numérico": extract_numeric_core(ref),
                          "ASIN (Jabiru ES)": jabiru_asin,
                          "Variantes buscadas": " | ".join(variants)})
     return pd.DataFrame(rows)
@@ -135,8 +160,7 @@ def check_turaco(refs: pd.Series,
     """
     rows = []
     for ref in refs:
-        ref_u = ref.upper()
-        for variant in [ref_u, f"S{ref_u}"]:
+        for variant in [v.upper() for v in build_variants(ref)]:
             if variant in jabiru_skus and variant not in turaco_skus:
                 asin = jabiru_map.get(variant, "")
                 rows.append({"SKU faltante en Turaco ES": variant,
@@ -177,21 +201,17 @@ with st.spinner("Cargando y procesando archivos…"):
                                      turaco_skus, turaco_map)
 
     # ── 2) Países internacionales ──────────────────────────────────────────────
-    df_es_missing = check_country(
-        refs, jabiru_skus, jabiru_map, jabiru_map,
-        lambda r: variants_es(r))
+    df_es_missing = check_country(refs, jabiru_skus, jabiru_map, jabiru_map,
+                                  country_prefix="")
 
-    df_fr_missing = check_country(
-        refs, fr_skus, fr_map, jabiru_map,
-        lambda r: variants_intl(r, "FR"))
+    df_fr_missing = check_country(refs, fr_skus, fr_map, jabiru_map,
+                                  country_prefix="FR")
 
-    df_it_missing = check_country(
-        refs, it_skus, it_map, jabiru_map,
-        lambda r: variants_intl(r, "IT"))
+    df_it_missing = check_country(refs, it_skus, it_map, jabiru_map,
+                                  country_prefix="IT")
 
-    df_de_missing = check_country(
-        refs, de_skus, de_map, jabiru_map,
-        lambda r: variants_intl(r, "DE"))
+    df_de_missing = check_country(refs, de_skus, de_map, jabiru_map,
+                                  country_prefix="DE")
 
 # ─── KPI summary ──────────────────────────────────────────────────────────────
 st.subheader("📊 Resumen")
