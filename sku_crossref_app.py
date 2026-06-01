@@ -157,49 +157,80 @@ def build_variants(ref: str, country_prefix: str = "") -> list:
     return variants
 
 
-def check_country(refs: pd.Series,
+def jabiru_bases_map(jabiru_df: pd.DataFrame) -> dict:
+    """
+    Construye un dict {base_upper -> (sku_jabiru, asin)} a partir de los SKUs
+    activos de Jabiru ES. La base es el núcleo sin prefijo de país.
+    """
+    result = {}
+    for _, row in jabiru_df.iterrows():
+        sku  = row["sku"]                       # ya está en upper
+        base = extract_base(sku).upper()
+        if base not in result:                  # primer SKU encontrado gana
+            result[base] = (sku, row["asin"])
+    return result
+
+
+def check_country(jabiru_bases: dict,
                   listing_skus: set,
-                  listing_map: dict,
-                  jabiru_map: dict,
                   country_prefix: str = "") -> pd.DataFrame:
     """
-    Para cada ref de PS comprueba si alguna variante existe en el listing.
-    Devuelve un DataFrame con los que FALTAN.
+    Para cada base activa de Jabiru ES, comprueba si existe alguna variante
+    en el listing del país. Devuelve los que FALTAN.
+
+    Para ES (Jabiru):   base, S+base
+    Para FR/IT/DE:      base, S+base, PREFIX+base
     """
     rows = []
-    for ref in refs:
-        variants = [v.upper() for v in build_variants(ref, country_prefix)]
-        found = any(v in listing_skus for v in variants)
-        if not found:
-            # Buscar ASIN en Jabiru ES como referencia
-            jabiru_asin = ""
-            for v in variants[:2]:          # núm y S+núm son los de ES
-                if v in jabiru_map:
-                    jabiru_asin = jabiru_map[v]
-                    break
-            rows.append({"SKU (ref PS)": ref,
-                         "Base SKU": extract_base(ref),
-                         "ASIN (Jabiru ES)": jabiru_asin,
-                         "Variantes buscadas": " | ".join(variants)})
+    for base, (sku_jabiru, asin) in jabiru_bases.items():
+        variants = [base, f"S{base}"]
+        if country_prefix:
+            variants.append(f"{country_prefix}{base}")
+        if not any(v in listing_skus for v in variants):
+            rows.append({
+                "SKU Jabiru ES":      sku_jabiru,
+                "Base SKU":           base,
+                "ASIN":               asin,
+                "Variantes buscadas": " | ".join(variants),
+            })
     return pd.DataFrame(rows)
 
 
-def check_turaco(refs: pd.Series,
-                 jabiru_skus: set,
-                 jabiru_map: dict,
-                 turaco_skus: set,
-                 turaco_map: dict) -> pd.DataFrame:
+def check_turaco(jabiru_bases: dict,
+                 turaco_skus: set) -> pd.DataFrame:
     """
-    Turaco ES debe tener los mismos SKUs que Jabiru ES.
-    Busca todos los SKUs de Jabiru que no estén en Turaco.
+    Turaco ES debe tener los mismos SKUs activos que Jabiru ES.
+    """
+    rows = []
+    for base, (sku_jabiru, asin) in jabiru_bases.items():
+        variants = [base, f"S{base}"]
+        if not any(v in turaco_skus for v in variants):
+            rows.append({
+                "SKU Jabiru ES": sku_jabiru,
+                "Base SKU":      base,
+                "ASIN":          asin,
+            })
+    return pd.DataFrame(rows)
+
+
+def check_jabiru_vs_ps(refs: pd.Series,
+                       jabiru_skus: set,
+                       jabiru_map: dict) -> pd.DataFrame:
+    """
+    Referencias PS que no tienen ninguna variante activa en Jabiru ES.
+    Estos son los SKUs que faltaría crear/activar primero en Jabiru.
     """
     rows = []
     for ref in refs:
-        for variant in [v.upper() for v in build_variants(ref)]:
-            if variant in jabiru_skus and variant not in turaco_skus:
-                asin = jabiru_map.get(variant, "")
-                rows.append({"SKU faltante en Turaco ES": variant,
-                             "ASIN (Jabiru ES)": asin})
+        base     = extract_base(ref).upper()
+        variants = [base, f"S{base}"]
+        if not any(v in jabiru_skus for v in variants):
+            rows.append({
+                "SKU (ref PS)":       ref,
+                "Base SKU":           base,
+                "Variantes buscadas": " | ".join(variants),
+            })
+    return pd.DataFrame(rows)
     return pd.DataFrame(rows)
 
 
@@ -239,37 +270,30 @@ with st.spinner("Calculando cruces…"):
     it_skus      = sku_set(it)
 
     jabiru_map   = sku_asin_map(jabiru)
-    turaco_map   = sku_asin_map(turaco)
-    de_map       = sku_asin_map(de)
-    fr_map       = sku_asin_map(fr)
-    it_map       = sku_asin_map(it)
 
-    # ── 1) Turaco ES vs Jabiru ES ──────────────────────────────────────────────
-    df_turaco_missing = check_turaco(refs, jabiru_skus, jabiru_map,
-                                     turaco_skus, turaco_map)
+    # Base única de cada SKU activo de Jabiru -> fuente de verdad para cruces
+    j_bases = jabiru_bases_map(jabiru)
 
-    # ── 2) Países internacionales ──────────────────────────────────────────────
-    df_es_missing = check_country(refs, jabiru_skus, jabiru_map, jabiru_map,
-                                  country_prefix="")
+    # ── 1) Referencias PS sin presencia activa en Jabiru ES ───────────────────
+    df_es_missing = check_jabiru_vs_ps(refs, jabiru_skus, jabiru_map)
 
-    df_fr_missing = check_country(refs, fr_skus, fr_map, jabiru_map,
-                                  country_prefix="FR")
+    # ── 2) Jabiru ES vs Turaco ES ─────────────────────────────────────────────
+    df_turaco_missing = check_turaco(j_bases, turaco_skus)
 
-    df_it_missing = check_country(refs, it_skus, it_map, jabiru_map,
-                                  country_prefix="IT")
-
-    df_de_missing = check_country(refs, de_skus, de_map, jabiru_map,
-                                  country_prefix="DE")
+    # ── 3) Jabiru ES vs países internacionales ────────────────────────────────
+    df_fr_missing = check_country(j_bases, fr_skus, country_prefix="FR")
+    df_it_missing = check_country(j_bases, it_skus, country_prefix="IT")
+    df_de_missing = check_country(j_bases, de_skus, country_prefix="DE")
 
 # ─── KPI summary ──────────────────────────────────────────────────────────────
 st.subheader("📊 Resumen")
 c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("Referencias PS", len(refs))
-c2.metric("❌ Jabiru ES faltante", len(df_es_missing))
-c3.metric("❌ Turaco ES faltante", len(df_turaco_missing))
-c4.metric("❌ FR faltante", len(df_fr_missing))
-c5.metric("❌ IT faltante", len(df_it_missing))
-c6.metric("❌ DE faltante", len(df_de_missing))
+c1.metric("Referencias PS",          len(refs))
+c2.metric("❌ Sin listing en Jabiru", len(df_es_missing))
+c3.metric("❌ Turaco ES faltante",    len(df_turaco_missing))
+c4.metric("❌ FR faltante",           len(df_fr_missing))
+c5.metric("❌ IT faltante",           len(df_it_missing))
+c6.metric("❌ DE faltante",           len(df_de_missing))
 
 st.divider()
 
@@ -307,28 +331,28 @@ def show_tab(df: pd.DataFrame, title: str, sku_col: str, asin_col: str):
 
 with tab_turaco:
     show_tab(df_turaco_missing,
-             "SKUs a crear en Turaco ES (que están en Jabiru ES pero no en Turaco ES)",
-             "SKU faltante en Turaco ES", "ASIN (Jabiru ES)")
+             "SKUs activos en Jabiru ES que faltan en Turaco ES",
+             "SKU Jabiru ES", "ASIN")
 
 with tab_es:
     show_tab(df_es_missing,
-             "SKUs a crear en Jabiru ES (referencias PS sin listing en Amazon ES)",
-             "SKU (ref PS)", "ASIN (Jabiru ES)")
+             "Referencias PS sin listing activo en Jabiru ES",
+             "SKU (ref PS)", "Base SKU")
 
 with tab_fr:
     show_tab(df_fr_missing,
-             "SKUs a crear en FR",
-             "SKU (ref PS)", "ASIN (Jabiru ES)")
+             "SKUs activos de Jabiru ES sin variante activa en FR",
+             "SKU Jabiru ES", "ASIN")
 
 with tab_it:
     show_tab(df_it_missing,
-             "SKUs a crear en IT",
-             "SKU (ref PS)", "ASIN (Jabiru ES)")
+             "SKUs activos de Jabiru ES sin variante activa en IT",
+             "SKU Jabiru ES", "ASIN")
 
 with tab_de:
     show_tab(df_de_missing,
-             "SKUs a crear en DE",
-             "SKU (ref PS)", "ASIN (Jabiru ES)")
+             "SKUs activos de Jabiru ES sin variante activa en DE",
+             "SKU Jabiru ES", "ASIN")
 
 with tab_export:
     st.markdown("### 📥 Exportar todos los resultados en un solo Excel")
@@ -339,16 +363,18 @@ with tab_export:
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        to_sheet(df_turaco_missing, "SKU faltante en Turaco ES", "ASIN (Jabiru ES)").to_excel(
-            writer, sheet_name="Turaco_ES", index=False)
-        to_sheet(df_es_missing, "SKU (ref PS)", "ASIN (Jabiru ES)").to_excel(
-            writer, sheet_name="Jabiru_ES", index=False)
-        to_sheet(df_fr_missing, "SKU (ref PS)", "ASIN (Jabiru ES)").to_excel(
-            writer, sheet_name="FR", index=False)
-        to_sheet(df_it_missing, "SKU (ref PS)", "ASIN (Jabiru ES)").to_excel(
-            writer, sheet_name="IT", index=False)
-        to_sheet(df_de_missing, "SKU (ref PS)", "ASIN (Jabiru ES)").to_excel(
-            writer, sheet_name="DE", index=False)
+        # Tab Jabiru ES: refs PS sin listing activo
+        df_es_missing[["SKU (ref PS)", "Base SKU"]].to_excel(
+            writer, sheet_name="Jabiru_ES_faltante", index=False)
+        # Turaco, FR, IT, DE: SKU Jabiru + ASIN + variantes
+        for df_out, sheet in [
+            (df_turaco_missing, "Turaco_ES"),
+            (df_fr_missing,     "FR"),
+            (df_it_missing,     "IT"),
+            (df_de_missing,     "DE"),
+        ]:
+            cols = [c for c in ["SKU Jabiru ES", "Base SKU", "ASIN", "Variantes buscadas"] if c in df_out.columns]
+            df_out[cols].to_excel(writer, sheet_name=sheet, index=False)
 
     st.download_button(
         "⬇️ Descargar Excel completo (todas las pestañas)",
