@@ -43,7 +43,7 @@ def read_ps(f) -> pd.Series:
     return refs[refs != ""]
 
 
-def read_listing(f, label: str) -> pd.DataFrame:
+def read_listing(f, label: str, active_only: bool = True) -> pd.DataFrame:
     try:
         df = pd.read_csv(f, sep="\t", dtype=str, low_memory=False,
                          encoding="utf-8-sig", on_bad_lines="skip")
@@ -54,8 +54,11 @@ def read_listing(f, label: str) -> pd.DataFrame:
     status_col = next((c for c in df.columns if c.strip().lower() == "status"), None)
     total_rows = len(df)
     if status_col:
-        df = df[df[status_col].str.strip().str.lower() == "active"].copy()
-    active_rows = len(df)
+        active_rows = int((df[status_col].str.strip().str.lower() == "active").sum())
+        if active_only:
+            df = df[df[status_col].str.strip().str.lower() == "active"].copy()
+    else:
+        active_rows = total_rows
 
     sku_col  = df.columns[0]
     asin_col = df.columns[1] if len(df.columns) > 1 else None
@@ -105,13 +108,22 @@ def build_sku_map(df: pd.DataFrame) -> dict:
     return df.drop_duplicates("sku").set_index("sku")["asin"].to_dict()
 
 
+# SKUs generados automáticamente por Amazon — no gestionables manualmente
+_AMZN_AUTO_PATTERN = re.compile(r"^AMZN\.", re.IGNORECASE)
+
 def jabiru_bases_map(jabiru_df: pd.DataFrame) -> dict:
-    """dict {base_upper -> (sku_jabiru, asin)}  — primer SKU encontrado por base."""
+    """
+    dict {base_upper -> (sku_jabiru, asin)} — primer SKU encontrado por base.
+    Excluye SKUs internos de Amazon (AMZN.*) que no se pueden crear manualmente.
+    """
     result = {}
     for _, row in jabiru_df.iterrows():
-        base = extract_base(row["sku"]).upper()
+        sku = row["sku"]
+        if _AMZN_AUTO_PATTERN.match(sku):   # ignorar SKUs automáticos de Amazon
+            continue
+        base = extract_base(sku).upper()
         if base not in result:
-            result[base] = (row["sku"], row["asin"])
+            result[base] = (sku, row["asin"])
     return result
 
 
@@ -183,51 +195,63 @@ if not files_ready:
 
 with st.spinner("Cargando y procesando archivos…"):
     refs   = read_ps(ps_file)
-    jabiru = read_listing(jabiru_file, "Jabiru ES")
-    turaco = read_listing(turaco_file, "Turaco ES")
-    de     = read_listing(de_file,     "DE")
-    fr     = read_listing(fr_file,     "FR")
-    it     = read_listing(it_file,     "IT")
+    # Jabiru: solo Active (fuente de verdad ES); Turaco: todos los estados para cruce
+    jabiru      = read_listing(jabiru_file, "Jabiru ES",  active_only=True)
+    turaco      = read_listing(turaco_file, "Turaco ES",  active_only=False)
+    # Internacionales: versión Active para cruce de espejos
+    # + versión ALL para comprobar si el SKU existe (cualquier estado)
+    de_active   = read_listing(de_file, "DE", active_only=True)
+    fr_active   = read_listing(fr_file, "FR", active_only=True)
+    it_active   = read_listing(it_file, "IT", active_only=True)
+    de_all      = read_listing(de_file, "DE", active_only=False)
+    fr_all      = read_listing(fr_file, "FR", active_only=False)
+    it_all      = read_listing(it_file, "IT", active_only=False)
 
 with st.sidebar:
     st.divider()
     st.markdown("**📊 SKUs activos por listing:**")
     for _df, flag in [(jabiru,"🇪🇸 Jabiru"),(turaco,"🇪🇸 Turaco"),
-                      (fr,"🇫🇷 FR"),(it,"🇮🇹 IT"),(de,"🇩🇪 DE")]:
+                      (fr_active,"🇫🇷 FR"),(it_active,"🇮🇹 IT"),(de_active,"🇩🇪 DE")]:
         total  = _df.attrs.get("total_rows", "?")
         active = _df.attrs.get("active_rows", len(_df))
         pct    = f"{active/total*100:.0f}%" if isinstance(total, int) and total > 0 else "?"
         st.caption(f"{flag}: **{active:,}** activos / {total:,} total ({pct})")
 
 with st.spinner("Calculando cruces…"):
-    jabiru_skus = set(jabiru["sku"])
-    turaco_skus = set(turaco["sku"])
-    fr_skus     = set(fr["sku"])
-    it_skus     = set(it["sku"])
-    de_skus     = set(de["sku"])
+    jabiru_skus     = set(jabiru["sku"])
+    turaco_skus     = set(turaco["sku"])
+    # Para cruce 1 (¿existe en el país?) -> usar todos los estados
+    fr_skus_all     = set(fr_all["sku"])
+    it_skus_all     = set(it_all["sku"])
+    de_skus_all     = set(de_all["sku"])
+    turaco_skus_all = turaco_skus  # Turaco ya carga todos los estados
+    # Para cruce 2 (espejo activo) -> usar solo Active
+    fr_skus_active  = set(fr_active["sku"])
+    it_skus_active  = set(it_active["sku"])
+    de_skus_active  = set(de_active["sku"])
 
-    jabiru_map = build_sku_map(jabiru)
-    turaco_map = build_sku_map(turaco)
-    fr_map     = build_sku_map(fr)
-    it_map     = build_sku_map(it)
-    de_map     = build_sku_map(de)
+    jabiru_map  = build_sku_map(jabiru)
+    turaco_map  = build_sku_map(turaco)
+    fr_map      = build_sku_map(fr_active)
+    it_map      = build_sku_map(it_active)
+    de_map      = build_sku_map(de_active)
 
     # Fuente de verdad: bases únicas activas de Jabiru
     j_bases = jabiru_bases_map(jabiru)
 
-    # ── Cruce 1: faltantes ────────────────────────────────────────────────────
+    # ── Cruce 1: faltantes (busca en TODOS los estados del listing) ───────────
     df_ps_vs_jabiru   = check_jabiru_vs_ps(jabiru, refs)
-    df_turaco_missing = check_turaco(j_bases, turaco_skus)
-    df_fr_missing     = check_country(j_bases, fr_skus,  "FR")
-    df_it_missing     = check_country(j_bases, it_skus,  "IT")
-    df_de_missing     = check_country(j_bases, de_skus,  "DE")
+    df_turaco_missing = check_turaco(j_bases, turaco_skus_all)
+    df_fr_missing     = check_country(j_bases, fr_skus_all,  "FR")
+    df_it_missing     = check_country(j_bases, it_skus_all,  "IT")
+    df_de_missing     = check_country(j_bases, de_skus_all,  "DE")
 
-    # ── Cruce 2: espejos S+SKU ────────────────────────────────────────────────
-    df_mirror_jabiru  = check_mirror(j_bases, jabiru_skus, jabiru_map, "Jabiru ES")
-    df_mirror_turaco  = check_mirror(j_bases, turaco_skus, turaco_map, "Turaco ES")
-    df_mirror_fr      = check_mirror(j_bases, fr_skus,     fr_map,     "FR")
-    df_mirror_it      = check_mirror(j_bases, it_skus,     it_map,     "IT")
-    df_mirror_de      = check_mirror(j_bases, de_skus,     de_map,     "DE")
+    # ── Cruce 2: espejos S+SKU (busca solo en Active) ─────────────────────────
+    df_mirror_jabiru  = check_mirror(j_bases, jabiru_skus,    jabiru_map, "Jabiru ES")
+    df_mirror_turaco  = check_mirror(j_bases, turaco_skus,    turaco_map, "Turaco ES")
+    df_mirror_fr      = check_mirror(j_bases, fr_skus_active, fr_map,     "FR")
+    df_mirror_it      = check_mirror(j_bases, it_skus_active, it_map,     "IT")
+    df_mirror_de      = check_mirror(j_bases, de_skus_active, de_map,     "DE")
 
     # Resumen unificado de espejos (todas las tiendas)
     df_mirror_all = pd.concat(
