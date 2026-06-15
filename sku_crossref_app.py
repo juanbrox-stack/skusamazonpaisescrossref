@@ -43,38 +43,42 @@ def read_ps(f) -> pd.Series:
     return refs[refs != ""]
 
 
-def read_listing(f, label: str, active_only: bool = True) -> pd.DataFrame:
+def read_listing(f, label: str) -> tuple:
+    """
+    Lee un listing Amazon una sola vez y devuelve (df_active, df_all, attrs).
+    df_active : solo filas con status == Active
+    df_all    : todas las filas (todos los estados)
+    attrs     : dict con total_rows y active_rows para el sidebar
+    Siempre lee el stream UNA SOLA VEZ para evitar el problema de UploadedFile agotado.
+    """
     try:
-        df = pd.read_csv(f, sep="\t", dtype=str, low_memory=False,
-                         encoding="utf-8-sig", on_bad_lines="skip")
+        raw = pd.read_csv(f, sep="\t", dtype=str, low_memory=False,
+                          encoding="utf-8-sig", on_bad_lines="skip")
     except Exception as e:
         st.error(f"❌ Error leyendo {label}: {e}")
-        return pd.DataFrame(columns=["sku", "asin"])
+        empty = pd.DataFrame(columns=["sku", "asin"])
+        return empty, empty, {"label": label, "total_rows": 0, "active_rows": 0}
 
-    status_col = next((c for c in df.columns if c.strip().lower() == "status"), None)
-    total_rows = len(df)
-    if status_col:
-        active_rows = int((df[status_col].str.strip().str.lower() == "active").sum())
-        if active_only:
-            df = df[df[status_col].str.strip().str.lower() == "active"].copy()
-    else:
-        active_rows = total_rows
+    status_col = next((c for c in raw.columns if c.strip().lower() == "status"), None)
+    total_rows = len(raw)
+    active_rows = int((raw[status_col].str.strip().str.lower() == "active").sum()) if status_col else total_rows
 
-    sku_col  = df.columns[0]
-    asin_col = df.columns[1] if len(df.columns) > 1 else None
-    df = df[[sku_col, asin_col]].copy() if asin_col else df[[sku_col]].copy()
-    df.columns = ["sku", "asin"] if asin_col else ["sku"]
-    df["sku"] = df["sku"].astype(str).str.strip().str.upper()
-    if "asin" not in df.columns:
-        df["asin"] = ""
-    else:
-        df["asin"] = df["asin"].astype(str).str.strip()
+    def _extract(df: pd.DataFrame) -> pd.DataFrame:
+        sku_col  = df.columns[0]
+        asin_col = df.columns[1] if len(df.columns) > 1 else None
+        out = df[[sku_col, asin_col]].copy() if asin_col else df[[sku_col]].copy()
+        out.columns = ["sku", "asin"] if asin_col else ["sku"]
+        out["sku"] = out["sku"].astype(str).str.strip().str.upper()
+        if "asin" not in out.columns:
+            out["asin"] = ""
+        else:
+            out["asin"] = out["asin"].astype(str).str.strip()
+        return out[out["sku"].notna() & (out["sku"] != "") & (out["sku"] != "nan")]
 
-    df = df[df["sku"].notna() & (df["sku"] != "") & (df["sku"] != "nan")]
-    df.attrs["label"]       = label
-    df.attrs["total_rows"]  = total_rows
-    df.attrs["active_rows"] = active_rows
-    return df
+    df_all    = _extract(raw)
+    df_active = _extract(raw[raw[status_col].str.strip().str.lower() == "active"].copy()) if status_col else df_all.copy()
+    attrs = {"label": label, "total_rows": total_rows, "active_rows": active_rows}
+    return df_active, df_all, attrs
 
 
 def extract_base(ref: str) -> str:
@@ -194,64 +198,63 @@ if not files_ready:
     st.stop()
 
 with st.spinner("Cargando y procesando archivos…"):
-    refs   = read_ps(ps_file)
-    # Jabiru: solo Active (fuente de verdad ES); Turaco: todos los estados para cruce
-    jabiru      = read_listing(jabiru_file, "Jabiru ES",  active_only=True)
-    turaco      = read_listing(turaco_file, "Turaco ES",  active_only=False)
-    # Internacionales: versión Active para cruce de espejos
-    # + versión ALL para comprobar si el SKU existe (cualquier estado)
-    de_active   = read_listing(de_file, "DE", active_only=True)
-    fr_active   = read_listing(fr_file, "FR", active_only=True)
-    it_active   = read_listing(it_file, "IT", active_only=True)
-    de_all      = read_listing(de_file, "DE", active_only=False)
-    fr_all      = read_listing(fr_file, "FR", active_only=False)
-    it_all      = read_listing(it_file, "IT", active_only=False)
+    refs = read_ps(ps_file)
+    # Cada listing se lee UNA SOLA VEZ y devuelve (df_active, df_all, attrs)
+    jabiru_active, jabiru_all, jabiru_attrs = read_listing(jabiru_file, "Jabiru ES")
+    turaco_active, turaco_all, turaco_attrs = read_listing(turaco_file, "Turaco ES")
+    de_active,     de_all,     de_attrs     = read_listing(de_file,     "DE")
+    fr_active,     fr_all,     fr_attrs     = read_listing(fr_file,     "FR")
+    it_active,     it_all,     it_attrs     = read_listing(it_file,     "IT")
+    # Alias para claridad semántica
+    jabiru = jabiru_active   # fuente de verdad ES: solo Active
 
 with st.sidebar:
     st.divider()
     st.markdown("**📊 SKUs activos por listing:**")
-    for _df, flag in [(jabiru,"🇪🇸 Jabiru"),(turaco,"🇪🇸 Turaco"),
-                      (fr_active,"🇫🇷 FR"),(it_active,"🇮🇹 IT"),(de_active,"🇩🇪 DE")]:
-        total  = _df.attrs.get("total_rows", "?")
-        active = _df.attrs.get("active_rows", len(_df))
-        pct    = f"{active/total*100:.0f}%" if isinstance(total, int) and total > 0 else "?"
+    for attrs, flag in [
+        (jabiru_attrs, "🇪🇸 Jabiru"), (turaco_attrs, "🇪🇸 Turaco"),
+        (fr_attrs, "🇫🇷 FR"), (it_attrs, "🇮🇹 IT"), (de_attrs, "🇩🇪 DE"),
+    ]:
+        total  = attrs.get("total_rows", "?")
+        active = attrs.get("active_rows", "?")
+        pct    = f"{active/total*100:.0f}%" if isinstance(total, int) and isinstance(active, int) and total > 0 else "?"
         st.caption(f"{flag}: **{active:,}** activos / {total:,} total ({pct})")
 
 with st.spinner("Calculando cruces…"):
-    jabiru_skus     = set(jabiru["sku"])
-    turaco_skus     = set(turaco["sku"])
-    # Para cruce 1 (¿existe en el país?) -> usar todos los estados
-    fr_skus_all     = set(fr_all["sku"])
-    it_skus_all     = set(it_all["sku"])
-    de_skus_all     = set(de_all["sku"])
-    turaco_skus_all = turaco_skus  # Turaco ya carga todos los estados
-    # Para cruce 2 (espejo activo) -> usar solo Active
-    fr_skus_active  = set(fr_active["sku"])
-    it_skus_active  = set(it_active["sku"])
-    de_skus_active  = set(de_active["sku"])
+    # Cruce 1: ¿existe el SKU en el país? -> todos los estados
+    jabiru_skus_active = set(jabiru_active["sku"])
+    turaco_skus_all    = set(turaco_all["sku"])
+    fr_skus_all        = set(fr_all["sku"])
+    it_skus_all        = set(it_all["sku"])
+    de_skus_all        = set(de_all["sku"])
+    # Cruce 2: ¿el espejo S+SKU está activo? -> solo Active
+    turaco_skus_active = set(turaco_active["sku"])
+    fr_skus_active     = set(fr_active["sku"])
+    it_skus_active     = set(it_active["sku"])
+    de_skus_active     = set(de_active["sku"])
 
-    jabiru_map  = build_sku_map(jabiru)
-    turaco_map  = build_sku_map(turaco)
-    fr_map      = build_sku_map(fr_active)
-    it_map      = build_sku_map(it_active)
-    de_map      = build_sku_map(de_active)
+    jabiru_map = build_sku_map(jabiru_active)
+    turaco_map = build_sku_map(turaco_active)
+    fr_map     = build_sku_map(fr_active)
+    it_map     = build_sku_map(it_active)
+    de_map     = build_sku_map(de_active)
 
     # Fuente de verdad: bases únicas activas de Jabiru
-    j_bases = jabiru_bases_map(jabiru)
+    j_bases = jabiru_bases_map(jabiru_active)
 
     # ── Cruce 1: faltantes (busca en TODOS los estados del listing) ───────────
-    df_ps_vs_jabiru   = check_jabiru_vs_ps(jabiru, refs)
+    df_ps_vs_jabiru   = check_jabiru_vs_ps(jabiru_active, refs)
     df_turaco_missing = check_turaco(j_bases, turaco_skus_all)
     df_fr_missing     = check_country(j_bases, fr_skus_all,  "FR")
     df_it_missing     = check_country(j_bases, it_skus_all,  "IT")
     df_de_missing     = check_country(j_bases, de_skus_all,  "DE")
 
     # ── Cruce 2: espejos S+SKU (busca solo en Active) ─────────────────────────
-    df_mirror_jabiru  = check_mirror(j_bases, jabiru_skus,    jabiru_map, "Jabiru ES")
-    df_mirror_turaco  = check_mirror(j_bases, turaco_skus,    turaco_map, "Turaco ES")
-    df_mirror_fr      = check_mirror(j_bases, fr_skus_active, fr_map,     "FR")
-    df_mirror_it      = check_mirror(j_bases, it_skus_active, it_map,     "IT")
-    df_mirror_de      = check_mirror(j_bases, de_skus_active, de_map,     "DE")
+    df_mirror_jabiru  = check_mirror(j_bases, jabiru_skus_active, jabiru_map, "Jabiru ES")
+    df_mirror_turaco  = check_mirror(j_bases, turaco_skus_active, turaco_map, "Turaco ES")
+    df_mirror_fr      = check_mirror(j_bases, fr_skus_active,     fr_map,     "FR")
+    df_mirror_it      = check_mirror(j_bases, it_skus_active,     it_map,     "IT")
+    df_mirror_de      = check_mirror(j_bases, de_skus_active,     de_map,     "DE")
 
     # Resumen unificado de espejos (todas las tiendas)
     df_mirror_all = pd.concat(
@@ -303,7 +306,7 @@ def show_table(df: pd.DataFrame, label_empty: str = "✅ Sin SKUs pendientes.",
             if c in df.columns:
                 mask |= df[c].astype(str).str.contains(q, case=False, na=False)
         filtered = df[mask]
-    st.dataframe(filtered, use_container_width=True, height=420)
+    st.dataframe(filtered, width="stretch", height=420)
     csv = filtered.to_csv(index=False).encode("utf-8-sig")
     st.download_button(f"⬇️ Descargar CSV", data=csv,
                        file_name=dl_name, mime="text/csv", key=f"dl_{dl_key}")
@@ -355,7 +358,7 @@ with tab_mirror:
         else:
             pivot = (df_mirror_all.groupby("Tienda")
                      .size().reset_index(name="S+SKU faltantes"))
-            st.dataframe(pivot, use_container_width=True, hide_index=True)
+            st.dataframe(pivot, width="stretch", hide_index=True)
             st.markdown("#### Detalle completo")
             show_table(df_mirror_all,
                        search_cols=["Tienda", "SKU Jabiru ES", "Base SKU", "SKU espejo", "ASIN base"],
