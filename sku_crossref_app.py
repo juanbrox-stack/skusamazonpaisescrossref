@@ -5,19 +5,28 @@ from openpyxl import load_workbook
 
 st.set_page_config(page_title="SKU CrossRef – Amazon", layout="wide", page_icon="🔗")
 
-# ─── Constants ────────────────────────────────────────────────────────────────
-AMZN_AUTO = re.compile(r'^AMZN\.', re.IGNORECASE)
+# ─── SKU structure ────────────────────────────────────────────────────────────
+# Jabiru ES / Turaco ES : SKU base  +  S+SKU
+# FR / IT / DE          : SKU base  +  S+SKU  +  XX+SKU  (XX = FR / IT / DE)
+# NL / PL / SE          : SKU base  +  S+SKU
+# Prestashop            : must have every SKU that exists in any Amazon store
 
-COUNTRIES = {
-    "Jabiru ES":  {"prefix": "",   "feed": "https://cecotec.es/api/v3/doofinder/feed/?lang=es",      "currency": "EUR", "flag": "🇪🇸", "mirror_only": False, "es_template": True},
-    "Turaco ES":  {"prefix": "",   "feed": "https://cecotec.es/api/v3/doofinder/feed/?lang=es",      "currency": "EUR", "flag": "🇪🇸", "mirror_only": False, "es_template": True},
-    "FR":         {"prefix": "FR", "feed": "https://storececotec.fr/api/v3/doofinder/feed/?lang=fr", "currency": "EUR", "flag": "🇫🇷", "mirror_only": False, "es_template": False},
-    "IT":         {"prefix": "IT", "feed": "https://content.storececotec.it/api/v3/doofinder/feed/?lang=it", "currency": "EUR", "flag": "🇮🇹", "mirror_only": False, "es_template": False},
-    "DE":         {"prefix": "DE", "feed": "https://storececotec.de/api/v3/doofinder/feed/?lang=de", "currency": "EUR", "flag": "🇩🇪", "mirror_only": False, "es_template": False},
-    "NL":         {"prefix": "",   "feed": "https://storececotec.de/api/v3/doofinder/feed/?lang=de", "currency": "EUR", "flag": "🇳🇱", "mirror_only": True,  "es_template": False},
-    "SE":         {"prefix": "",   "feed": "https://storececotec.de/api/v3/doofinder/feed/?lang=de", "currency": "SEK", "flag": "🇸🇪", "mirror_only": True,  "es_template": False},
-    "PL":         {"prefix": "",   "feed": "https://storececotec.de/api/v3/doofinder/feed/?lang=de", "currency": "PLN", "flag": "🇵🇱", "mirror_only": True,  "es_template": False},
+STORE_CONFIG = {
+    # key: (label, flag, prefixes_required, file_key)
+    "jabiru_es":  ("Jabiru ES",  "🇪🇸", ["", "S"],           "jabiru_es"),
+    "jabiru_fr":  ("Jabiru FR",  "🇫🇷", ["", "S", "FR"],     "jabiru_fr"),
+    "jabiru_it":  ("Jabiru IT",  "🇮🇹", ["", "S", "IT"],     "jabiru_it"),
+    "jabiru_de":  ("Jabiru DE",  "🇩🇪", ["", "S", "DE"],     "jabiru_de"),
+    "jabiru_nl":  ("Jabiru NL",  "🇳🇱", ["", "S"],           "jabiru_nl"),
+    "jabiru_pl":  ("Jabiru PL",  "🇵🇱", ["", "S"],           "jabiru_pl"),
+    "jabiru_se":  ("Jabiru SE",  "🇸🇪", ["", "S"],           "jabiru_se"),
+    "turaco_es":  ("Turaco ES",  "🇪🇸", ["", "S"],           "turaco_es"),
+    "turaco_fr":  ("Turaco FR",  "🇫🇷", ["", "S", "FR"],     "turaco_fr"),
+    "turaco_it":  ("Turaco IT",  "🇮🇹", ["", "S", "IT"],     "turaco_it"),
+    "turaco_de":  ("Turaco DE",  "🇩🇪", ["", "S", "DE"],     "turaco_de"),
 }
+
+AMZN_AUTO = re.compile(r'^AMZN\.', re.IGNORECASE)
 
 # ─── Core helpers ─────────────────────────────────────────────────────────────
 def extract_base(ref: str) -> str:
@@ -25,97 +34,209 @@ def extract_base(ref: str) -> str:
     if "_" in ref:
         m = re.search(r"([A-Z]\d{2}_)", ref.upper())
         return ref[m.start():] if m else ref
-    m = re.match(r"^(DE|FR|IT|S)([A-Z]?\d+.*)$", ref, re.IGNORECASE)
+    m = re.match(r"^(DE|FR|IT|NL|PL|SE|S)([A-Z]?\d+.*)$", ref, re.IGNORECASE)
     if m:
         rest = m.group(2)
         return rest.zfill(5) if re.match(r"^\d+$", rest) else rest
     return ref.zfill(5) if re.match(r"^\d+$", ref) else ref
 
 @st.cache_data(show_spinner=False)
-def parse_ps(data: bytes) -> pd.Series:
-    df = pd.read_csv(io.BytesIO(data), sep=";", dtype=str, low_memory=False)
-    col = next((c for c in df.columns if c.strip().lower() == "reference"), None)
-    if not col:
-        return pd.Series(dtype=str)
-    s = df[col].dropna().str.strip()
-    return s[s != ""]
-
-@st.cache_data(show_spinner=False)
 def parse_listing(data: bytes, label: str) -> tuple:
-    """Returns (df_active, df_all, attrs). Cached by file content."""
+    """Returns (df_active, df_all, attrs). Cached by file content hash."""
     try:
         raw = pd.read_csv(io.BytesIO(data), sep="\t", dtype=str, low_memory=False,
                           encoding="utf-8-sig", on_bad_lines="skip")
     except Exception as e:
-        st.error(f"❌ Error leyendo {label}: {e}")
+        st.error(f"❌ {label}: {e}")
         empty = pd.DataFrame(columns=["sku","asin"])
-        return empty, empty, {"label": label, "total_rows": 0, "active_rows": 0}
+        return empty, empty, {"label": label, "total": 0, "active": 0}
 
     sc = next((c for c in raw.columns if c.strip().lower() == "status"), None)
     total = len(raw)
     active_n = int((raw[sc].str.strip().str.lower() == "active").sum()) if sc else total
 
-    def _extract(df):
+    def _ex(df):
         out = df[[df.columns[0], df.columns[1]]].copy()
         out.columns = ["sku","asin"]
         out["sku"] = out["sku"].astype(str).str.strip().str.upper()
         out["asin"] = out["asin"].astype(str).str.strip()
         return out[out["sku"].notna() & (out["sku"] != "") & (out["sku"] != "nan")]
 
-    df_all    = _extract(raw)
-    df_active = _extract(raw[raw[sc].str.strip().str.lower() == "active"]) if sc else df_all.copy()
-    return df_active, df_all, {"label": label, "total_rows": total, "active_rows": active_n}
+    df_all = _ex(raw)
+    df_active = _ex(raw[raw[sc].str.strip().str.lower() == "active"]) if sc else df_all.copy()
+    return df_active, df_all, {"label": label, "total": total, "active": active_n}
 
+@st.cache_data(show_spinner=False)
+def parse_ps(data: bytes) -> pd.Series:
+    df = pd.read_csv(io.BytesIO(data), sep=";", dtype=str, low_memory=False)
+    col = next((c for c in df.columns if c.strip().lower() == "reference"), None)
+    if not col: return pd.Series(dtype=str)
+    s = df[col].dropna().str.strip()
+    return s[s != ""]
+
+def sku_set(df): return set(df["sku"].str.upper().dropna())
 def sku_map(df): return df.drop_duplicates("sku").set_index("sku")["asin"].to_dict()
 
-def jabiru_bases(jdf):
-    r = {}
+def jabiru_bases(jdf: pd.DataFrame) -> dict:
+    """Extract unique bases from Jabiru ES active SKUs. Ignores AMZN.* auto-SKUs."""
+    result = {}
     for _, row in jdf.iterrows():
         if AMZN_AUTO.match(row["sku"]): continue
         b = extract_base(row["sku"]).upper()
-        if b not in r: r[b] = (row["sku"], row["asin"])
-    return r
+        if b not in result:
+            result[b] = (row["sku"], row["asin"])
+    return result
 
-# ─── Cross checks ─────────────────────────────────────────────────────────────
-def check_ps(jdf, refs):
-    ps_bases = {extract_base(r).upper() for r in refs}
-    rows = [{"SKU Jabiru ES": row["sku"], "Base SKU": extract_base(row["sku"]).upper(),
-              "ASIN": row["asin"]}
-            for _, row in jdf.iterrows()
-            if extract_base(row["sku"]).upper() not in ps_bases]
-    return pd.DataFrame(rows)
-
-def check_missing(j_bases, listing_skus, prefix):
+# ─── Cross-check functions ────────────────────────────────────────────────────
+def missing_variants(j_bases: dict, target_skus: set, prefixes: list) -> pd.DataFrame:
+    """
+    For each Jabiru ES base, checks that ALL required prefix variants exist in target.
+    Returns rows where at least one required variant is missing.
+    prefixes: list of prefixes to check, e.g. ["", "S"] or ["", "S", "FR"]
+    """
     rows = []
     for base, (sku_j, asin) in j_bases.items():
-        variants = [base, f"S{base}"] + ([f"{prefix}{base}"] if prefix else [])
-        if not any(v in listing_skus for v in variants):
-            rows.append({"SKU Jabiru ES": sku_j, "Base SKU": base, "ASIN": asin,
-                         "Variantes buscadas": " | ".join(variants)})
+        missing = []
+        for pfx in prefixes:
+            variant = f"{pfx}{base}"
+            if variant not in target_skus:
+                missing.append(variant)
+        if missing:
+            all_variants = [f"{p}{base}" for p in prefixes]
+            rows.append({
+                "SKU Jabiru ES":    sku_j,
+                "Base SKU":         base,
+                "ASIN":             asin,
+                "Faltantes":        " | ".join(missing),
+                "Variantes req.":   " | ".join(all_variants),
+            })
     return pd.DataFrame(rows)
 
-def check_mirror(j_bases, listing_skus, listing_map, store):
+def ps_missing(j_bases: dict, turaco_sets: dict, ps_refs: pd.Series) -> pd.DataFrame:
+    """
+    Check which SKUs (across all stores and all prefix variants) are missing in PS.
+    PS must have every single SKU that any store uses.
+    """
+    ps_set = set(extract_base(r).upper() for r in ps_refs)
+    # Also include S+base, FR+base etc. as PS references to check
+    # In PS, references are stored as: 00234, S00234, FR00234, etc.
+    ps_refs_upper = set(r.strip().upper() for r in ps_refs)
+
     rows = []
-    for base, (sku_j, asin_base) in j_bases.items():
-        s = f"S{base}"
-        if s not in listing_skus:
-            rows.append({"Tienda": store, "SKU Jabiru ES": sku_j, "Base SKU": base,
-                         "SKU espejo": s, "ASIN base": asin_base,
-                         "ASIN espejo": listing_map.get(s, "")})
+    seen = set()
+    for base, (sku_j, asin) in j_bases.items():
+        # All variants that should exist across all stores
+        all_variants = set()
+        all_variants.update([base, f"S{base}"])          # ES / NL / PL / SE
+        all_variants.update([f"FR{base}", f"IT{base}", f"DE{base}"])  # international
+        for v in all_variants:
+            if v not in ps_refs_upper and v not in seen:
+                seen.add(v)
+                rows.append({
+                    "Referencia faltante PS": v,
+                    "Base SKU":              base,
+                    "ASIN":                  asin,
+                    "SKU Jabiru ES":         sku_j,
+                })
     return pd.DataFrame(rows)
 
-# ─── Feed & price ─────────────────────────────────────────────────────────────
+# ─── PS CSV generator ─────────────────────────────────────────────────────────
+PS_TPL_COLS = [
+    "Product ID","Active (0/1)","Name *","Categories (x,y,z...)","Price tax included",
+    "Tax rules ID","Wholesale price","On sale (0/1)","Discount amount","Discount percent",
+    "Discount from (yyyy-mm-dd)","Discount to (yyyy-mm-dd)","Reference #",
+    "Supplier reference #","Supplier","Manufacturer","EAN13","UPC","Ecotax",
+    "Width","Height","Depth","Weight","Quantity","Minimal quantity","Low stock level",
+    "Visibility","Additional shipping cost","Unity","Unit price",
+    "Short description","Description","Tags (x,y,z...)","Meta title","Meta keywords",
+    "Meta description","URL rewritten","Text when in stock","Text when backorder allowed",
+    "Available for order (0 = No, 1 = Yes)","Product available date",
+    "Product creation date","Show price (0 = No, 1 = Yes)",
+    "Image URLs (x,y,z...)","Image alt texts (x,y,z...)",
+    "Delete existing images (0 = No, 1 = Yes)","Feature(Name:Value:Position)",
+    "Available online only (0 = No, 1 = Yes)","Condition",
+    "Customizable (0 = No, 1 = Yes)","Uploadable files (0 = No, 1 = Yes)",
+    "Text fields (0 = No, 1 = Yes)","Out of stock","ID / Name of shop",
+    "Advanced stock management","Depends On Stock","Warehouse",
+]
+
+@st.cache_data(show_spinner=False)
+def build_ps_lookups(ps_sql_bytes: bytes, ps_carga_bytes: bytes | None):
+    sql = pd.read_csv(io.BytesIO(ps_sql_bytes), sep=";", dtype=str, low_memory=False)
+    sql["ref_key"] = sql["reference"].str.strip().str.upper()
+    sql_lk = sql.drop_duplicates("ref_key").set_index("ref_key")
+    carga_lk = None
+    if ps_carga_bytes:
+        carga = pd.read_excel(io.BytesIO(ps_carga_bytes), dtype=str)
+        if "Reference #" in carga.columns:
+            carga["ref_key"] = carga["Reference #"].str.strip().str.upper()
+            carga_lk = carga.drop_duplicates("ref_key").set_index("ref_key")
+    return sql_lk, carga_lk
+
+def make_ps_row(ref: str, base: str, sql_lk, carga_lk) -> dict:
+    sql_d   = sql_lk.loc[base]   if sql_lk   is not None and base in sql_lk.index   else None
+    carga_d = carga_lk.loc[base] if carga_lk is not None and base in carga_lk.index else None
+    price_ti = ""
+    if carga_d is not None:
+        price_ti = str(carga_d.get("Price tax included","") or "").strip()
+    if not price_ti and sql_d is not None:
+        try: price_ti = str(round(float(str(sql_d.get("price","0")).replace(",",".")) * 1.21, 2))
+        except: pass
+    r = {c: "" for c in PS_TPL_COLS}
+    r.update({"Active (0/1)":"1","Reference #":ref,"Supplier reference #":ref,
+               "Tax rules ID":"1","On sale (0/1)":"0","Quantity":"0",
+               "Minimal quantity":"1","Visibility":"both","Text when in stock":"In Stock",
+               "Available for order (0 = No, 1 = Yes)":"1","Show price (0 = No, 1 = Yes)":"1",
+               "Delete existing images (0 = No, 1 = Yes)":"0",
+               "Available online only (0 = No, 1 = Yes)":"1","Condition":"new",
+               "Customizable (0 = No, 1 = Yes)":"0","Uploadable files (0 = No, 1 = Yes)":"0",
+               "Text fields (0 = No, 1 = Yes)":"0","Out of stock":"0",
+               "ID / Name of shop":"0","Advanced stock management":"0",
+               "Depends On Stock":"0","Warehouse":"0"})
+    if sql_d is not None:
+        r["EAN13"] = str(sql_d.get("ean13","") or "").strip()
+        for f in ["width","height","depth","weight"]:
+            r[f.capitalize()] = str(sql_d.get(f,"1") or "1").strip() or "1"
+        r["Wholesale price"] = str(sql_d.get("wholesale_price","") or "").strip()
+        r["Supplier"] = r["Manufacturer"] = "Cecotec"
+    if carga_d is not None:
+        for field in ["Name *","Categories (x,y,z...)","Description","Short description",
+                      "Image URLs (x,y,z...)","Image alt texts (x,y,z...)","Tags (x,y,z...)",
+                      "EAN13","Width","Height","Depth","Weight","Wholesale price",
+                      "Supplier","Manufacturer","Meta title","Meta keywords","Meta description"]:
+            val = carga_d.get(field,"")
+            if pd.notna(val) and str(val).strip():
+                r[field] = str(val).strip()
+    if price_ti: r["Price tax included"] = price_ti
+    return r
+
+def gen_ps_csv(df_missing: pd.DataFrame, sql_lk, carga_lk) -> bytes:
+    rows = []
+    for _, row in df_missing.iterrows():
+        ref  = str(row.get("Referencia faltante PS", row.get("Faltantes",""))).strip()
+        base = str(row.get("Base SKU","")).strip().upper()
+        # If multiple faltantes in one row, split and create one row per variant
+        for r in ref.split("|"):
+            r = r.strip()
+            if r:
+                rows.append(make_ps_row(r, base, sql_lk, carga_lk))
+    df_out = pd.DataFrame(rows, columns=PS_TPL_COLS)
+    buf = io.BytesIO()
+    df_out.to_csv(buf, index=False, encoding="utf-8-sig")
+    return buf.getvalue()
+
+# ─── Amazon template ──────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_feed(url: str) -> dict:
     try:
-        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        r = requests.get(url, timeout=20, headers={"User-Agent":"Mozilla/5.0"})
         r.raise_for_status()
         data = r.json()
-        items = data if isinstance(data, list) else data.get("items", data.get("results", data.get("products", [])))
+        items = data if isinstance(data,list) else data.get("items",data.get("results",data.get("products",[])))
         m = {}
         for item in items:
-            mpn = str(item.get("mpn", item.get("reference", ""))).strip().upper()
-            price = str(item.get("price", item.get("sale_price", "")))
+            mpn = str(item.get("mpn", item.get("reference",""))).strip().upper()
+            price = str(item.get("price", item.get("sale_price","")))
             if mpn and price:
                 m[mpn] = price
                 m[mpn.lstrip("0") or "0"] = price
@@ -123,49 +244,47 @@ def fetch_feed(url: str) -> dict:
     except Exception as e:
         return {"__error__": str(e)}
 
-def get_price(base: str, feed: dict, fallback: dict = None) -> str:
+def get_price(base: str, feed: dict, es_feed: dict) -> str:
     def _look(m, b):
         if not m or "__error__" in m: return ""
         for k in [b, b.lstrip("0") or "0", b.zfill(5)]:
             if k in m: return m[k]
         return ""
-    p = _look(feed, base)
-    if not p and fallback: p = _look(fallback, base)
-    return p
+    return _look(feed, base) or _look(es_feed, base)
 
-# ─── Amazon template ──────────────────────────────────────────────────────────
-def gen_template(rows, feed, rate=1.0, fallback=None):
+def gen_amz_template(df: pd.DataFrame, feed: dict, es_feed: dict, rate: float) -> bytes:
     tmpl = st.session_state.get("template_bytes")
-    if not tmpl:
-        raise ValueError("Sube la plantilla Amazon ES en el panel lateral.")
+    if not tmpl: raise ValueError("Sube la plantilla Amazon ES en el panel lateral.")
     wb = load_workbook(io.BytesIO(tmpl), keep_vba=True)
     ws = wb["Plantilla"]
     for row in ws.iter_rows(min_row=7, max_row=ws.max_row):
         for cell in row: cell.value = None
-    for i, item in enumerate(rows, start=7):
-        asin, sku, base = item["asin"], item["sku"], item["base_sku"]
-        ws.cell(i, 1).value  = asin
-        ws.cell(i, 4).value  = "Añadir producto"
-        ws.cell(i, 5).value  = sku
-        ws.cell(i, 6).value  = asin
-        ws.cell(i, 12).value = "Nuevo"
-        ws.cell(i, 36).value = "Logística por parte del vendedor (predeterminado)"
-        ws.cell(i, 40).value = "Habilitado"
-        price_str = get_price(base, feed, fallback)
-        if price_str:
-            try: ws.cell(i, 41).value = round(float(price_str.replace(",",".")) * rate, 2)
+    for i, (_, row) in enumerate(df.iterrows(), start=7):
+        asin = row.get("ASIN","")
+        sku  = row.get("SKU Jabiru ES", row.get("Faltantes","").split("|")[0].strip())
+        base = row.get("Base SKU","")
+        ws.cell(i,1).value  = asin
+        ws.cell(i,4).value  = "Añadir producto"
+        ws.cell(i,5).value  = sku
+        ws.cell(i,6).value  = asin
+        ws.cell(i,12).value = "Nuevo"
+        ws.cell(i,36).value = "Logística por parte del vendedor (predeterminado)"
+        ws.cell(i,40).value = "Habilitado"
+        p = get_price(base, feed, es_feed)
+        if p:
+            try: ws.cell(i,41).value = round(float(p.replace(",",".")) * rate, 2)
             except: pass
-        ws.cell(i, 66).value = "FBM NO HB"
+        ws.cell(i,66).value = "FBM NO HB"
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
-# ─── UI components ────────────────────────────────────────────────────────────
-def show_table(df, dl_key, dl_name):
+# ─── UI helpers ───────────────────────────────────────────────────────────────
+def show_table(df: pd.DataFrame, dl_key: str, dl_name: str):
     if df.empty:
-        st.success("✅ Sin SKUs pendientes.")
+        st.success("✅ Sin diferencias.")
         return
-    st.warning(f"⚠️ **{len(df):,} SKUs** pendientes.")
+    st.warning(f"⚠️ **{len(df):,}** bases con variantes faltantes.")
     q = st.text_input("🔍 Filtrar", key=f"q_{dl_key}")
     filt = df
     if q:
@@ -177,194 +296,253 @@ def show_table(df, dl_key, dl_name):
     st.download_button("⬇️ CSV", filt.to_csv(index=False).encode("utf-8-sig"),
                        file_name=dl_name, mime="text/csv", key=f"dl_{dl_key}")
 
-def template_btn(df, feed, rate, fallback, dl_key, label, show_es_template):
-    """Render the Amazon ES template button (ES only)."""
-    if df.empty or not show_es_template: return
-    has = bool(st.session_state.get("template_bytes"))
-    with st.expander("📋 Generar plantilla Amazon ES"):
-        if not has:
-            st.info("📤 Sube la plantilla Amazon ES en el panel lateral.")
-            return
-        if st.button(f"Generar – {label}", key=f"gen_{dl_key}"):
-            rows = [{"asin": r.get("ASIN", r.get("ASIN base","")),
-                     "sku":  r.get("SKU Jabiru ES", r.get("SKU espejo","")),
-                     "base_sku": r.get("Base SKU","")}
-                    for _, r in df.iterrows()]
-            with st.spinner("Generando…"):
-                try:
-                    data = gen_template(rows, feed, rate, fallback)
-                    st.download_button("⬇️ Plantilla Amazon ES",
-                                       data=data,
-                                       file_name=f"amz_ES_{dl_key}.xlsm",
-                                       mime="application/vnd.ms-excel.sheet.macroEnabled.12",
-                                       key=f"dl_t_{dl_key}")
-                except Exception as e:
-                    st.error(str(e))
+def action_buttons(df: pd.DataFrame, dl_key: str, label: str,
+                   feed: dict, es_feed: dict, rate: float,
+                   sql_lk, carga_lk,
+                   show_amz: bool = False, show_ps: bool = True):
+    """Render download action buttons below a results table."""
+    if df.empty: return
+    col1, col2 = st.columns(2) if (show_amz and show_ps) else (st, None)
 
-def country_section(key, label, flag, df_c1, df_c2,
-                    feed, rate, fallback, show_es_template):
-    """Render one country tab: C1 + C2 + optional template."""
-    c1, c2 = st.tabs([f"Cruce 1 – Faltantes ({len(df_c1)})",
-                       f"Cruce 2 – Espejos ({len(df_c2)})"])
-    with c1:
-        show_table(df_c1, f"c1_{key}", f"c1_{key}.csv")
-        template_btn(df_c1, feed, rate, fallback, f"c1t_{key}", label, show_es_template)
-    with c2:
-        show_table(df_c2, f"c2_{key}", f"c2_{key}.csv")
-        template_btn(df_c2, feed, rate, fallback, f"c2t_{key}", label, show_es_template)
+    if show_amz:
+        target = col1 if col2 else st
+        with target.expander("📋 Plantilla Amazon ES"):
+            if not st.session_state.get("template_bytes"):
+                st.info("📤 Sube la plantilla Amazon ES en el panel lateral.")
+            elif st.button(f"Generar – {label}", key=f"amz_{dl_key}"):
+                with st.spinner("Generando…"):
+                    try:
+                        data = gen_amz_template(df, feed, es_feed, rate)
+                        st.download_button("⬇️ Plantilla Amazon ES", data=data,
+                                           file_name=f"amz_{dl_key}.xlsm",
+                                           mime="application/vnd.ms-excel.sheet.macroEnabled.12",
+                                           key=f"amz_dl_{dl_key}")
+                    except Exception as e: st.error(str(e))
+
+    if show_ps and sql_lk is not None:
+        target = col2 if col2 else st
+        with target.expander("🛒 CSV carga Prestashop"):
+            if not carga_lk:
+                st.caption("💡 Sube Carga_PS en el lateral para enriquecer con nombre e imágenes.")
+            if st.button(f"Generar CSV PS – {label}", key=f"ps_{dl_key}"):
+                with st.spinner("Generando…"):
+                    csv_b = gen_ps_csv(df, sql_lk, carga_lk)
+                    st.download_button("⬇️ CSV carga PS", data=csv_b,
+                                       file_name=f"carga_PS_{dl_key}.csv",
+                                       mime="text/csv", key=f"ps_dl_{dl_key}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR
 # ═══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
-    st.header("📂 Archivos base")
-    ps_file     = st.file_uploader("📦 Prestashop BD (CSV ;)",  type=["csv","txt"], key="ps")
-    jabiru_file = st.file_uploader("🇪🇸 Jabiru ES",              type=["txt","tsv","csv"], key="jabiru")
+    st.header("📂 Archivos base (obligatorios)")
+    ps_file     = st.file_uploader("📦 Prestashop BD (CSV ;)", type=["csv","txt"], key="ps")
+    jabiru_file = st.file_uploader("🇪🇸 Jabiru ES",             type=["txt","tsv","csv"], key="jabiru_es")
 
     st.divider()
-    st.header("🌍 Listings por país")
-    st.caption("Activa solo los que quieras procesar:")
+    st.header("🏪 Tiendas a comparar")
+    st.caption("Activa y sube el listing de cada tienda:")
 
-    listing_files = {}
-    listing_checks = {}
-    LISTING_DEFS = [
-        ("turaco", "🇪🇸 Turaco ES"),
-        ("fr",     "🇫🇷 FR"),
-        ("it",     "🇮🇹 IT"),
-        ("de",     "🇩🇪 DE"),
-        ("nl",     "🇳🇱 NL"),
-        ("se",     "🇸🇪 SE"),
-        ("pl",     "🇵🇱 PL"),
+    store_files = {}
+    store_enabled = {}
+    OTHER_STORES = [
+        ("jabiru_fr",  "Jabiru FR",  "🇫🇷"),
+        ("jabiru_it",  "Jabiru IT",  "🇮🇹"),
+        ("jabiru_de",  "Jabiru DE",  "🇩🇪"),
+        ("jabiru_nl",  "Jabiru NL",  "🇳🇱"),
+        ("jabiru_pl",  "Jabiru PL",  "🇵🇱"),
+        ("jabiru_se",  "Jabiru SE",  "🇸🇪"),
+        ("turaco_es",  "Turaco ES",  "🇪🇸"),
+        ("turaco_fr",  "Turaco FR",  "🇫🇷"),
+        ("turaco_it",  "Turaco IT",  "🇮🇹"),
+        ("turaco_de",  "Turaco DE",  "🇩🇪"),
     ]
-    for key, lbl in LISTING_DEFS:
-        checked = st.checkbox(lbl, value=True, key=f"chk_{key}")
-        listing_checks[key] = checked
-        if checked:
-            f = st.file_uploader(f"  ↳ Fichero {lbl}", type=["txt","tsv","csv"],
+    for key, lbl, flag in OTHER_STORES:
+        enabled = st.checkbox(f"{flag} {lbl}", value=False, key=f"chk_{key}")
+        store_enabled[key] = enabled
+        if enabled:
+            f = st.file_uploader(f"↳ {lbl}", type=["txt","tsv","csv"],
                                  key=f"file_{key}", label_visibility="collapsed")
-            listing_files[key] = f
+            store_files[key] = f
         else:
-            listing_files[key] = None
+            store_files[key] = None
 
     st.divider()
-    st.header("📋 Plantilla Amazon ES")
-    tpl = st.file_uploader("Sube la plantilla (.xlsm)", type=["xlsm","xlsx"], key="tpl")
+    st.header("📋 Extras")
+    tpl = st.file_uploader("Plantilla Amazon ES (.xlsm)", type=["xlsm","xlsx"], key="tpl")
     if tpl:
         st.session_state["template_bytes"] = tpl.read()
-        st.success("✅ Plantilla cargada")
+        st.success("✅ Plantilla lista")
+    ps_carga = st.file_uploader("Carga_PS enriquecimiento (.xlsx)", type=["xlsx"], key="ps_carga")
+    if ps_carga:
+        st.session_state["ps_carga_bytes"] = ps_carga.read()
+        st.success("✅ Carga_PS lista")
 
     st.divider()
     st.header("💱 Tipos de cambio")
-    rate_sek = st.number_input("SEK / EUR", value=st.session_state.get("rate_sek", 11.5),
+    rate_sek = st.number_input("SEK/EUR", value=st.session_state.get("rate_sek",11.5),
                                 min_value=0.01, step=0.1, key="rate_sek")
-    rate_pln = st.number_input("PLN / EUR", value=st.session_state.get("rate_pln", 4.25),
+    rate_pln = st.number_input("PLN/EUR", value=st.session_state.get("rate_pln",4.25),
                                 min_value=0.01, step=0.01, key="rate_pln")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 st.title("🔗 SKU CrossRef – Amazon Listings")
-st.caption("Cruza el catálogo de Prestashop con los listings de Amazon y detecta SKUs a crear por país.")
+st.markdown("""
+**Fuente de verdad:** Jabiru ES. Comprueba que todos los marketplaces y Prestashop tienen
+paridad de SKUs con Jabiru ES.
+
+| Tienda | Variantes requeridas |
+|---|---|
+| Jabiru ES / Turaco ES | `SKU`  `S+SKU` |
+| Jabiru FR / IT / DE / Turaco FR / IT / DE | `SKU`  `S+SKU`  `XX+SKU` |
+| Jabiru NL / PL / SE | `SKU`  `S+SKU` |
+| Prestashop | todas las variantes de todas las tiendas |
+""")
 
 if not ps_file or not jabiru_file:
-    st.info("👈 Carga al menos el CSV de Prestashop y el listing de Jabiru ES para comenzar.")
+    st.info("👈 Carga el CSV de Prestashop y el listing de **Jabiru ES** para comenzar.")
     st.stop()
 
-# ─── Load base files ──────────────────────────────────────────────────────────
-with st.spinner("Leyendo Prestashop y Jabiru ES…"):
-    refs = parse_ps(ps_file.read())
-    jab_active, jab_all, jab_attrs = parse_listing(jabiru_file.read(), "Jabiru ES")
+# ─── Load base data ───────────────────────────────────────────────────────────
+ps_raw = ps_file.read()
+st.session_state["ps_bytes_raw"] = ps_raw
+refs = parse_ps(ps_raw)
 
-j_bases  = jabiru_bases(jab_active)
-jab_skus = set(jab_all["sku"])
-jab_map  = sku_map(jab_all)
+jab_active, jab_all, jab_attrs = parse_listing(jabiru_file.read(), "Jabiru ES")
+j_bases = jabiru_bases(jab_active)
+jab_skus = sku_set(jab_all)
 
-# ─── Feeds (optional) ─────────────────────────────────────────────────────────
+# PS lookups
+sql_lk, carga_lk = build_ps_lookups(
+    st.session_state["ps_bytes_raw"],
+    st.session_state.get("ps_carga_bytes")
+)
+
+# Feeds
 feed_maps = st.session_state.get("feed_maps", {})
 with st.expander("🌐 Precios desde feeds Cecotec (opcional)"):
-    active_countries = [k for k,v in listing_checks.items() if v] + ["jabiru"]
-    to_load = st.multiselect("Países a cargar", list(COUNTRIES.keys()),
-                              default=[c for c in COUNTRIES if c in ["Jabiru ES","FR","IT","DE"]])
-    if st.button("Cargar feeds seleccionados"):
-        for country in to_load:
-            cfg = COUNTRIES[country]
-            with st.spinner(f"Cargando {country}…"):
-                feed_maps[country] = fetch_feed(cfg["feed"])
-                if "__error__" in feed_maps[country]:
-                    st.warning(f"⚠️ {country}: {feed_maps[country]['__error__']}")
+    FEED_URLS = {
+        "ES": "https://cecotec.es/api/v3/doofinder/feed/?lang=es",
+        "FR": "https://storececotec.fr/api/v3/doofinder/feed/?lang=fr",
+        "IT": "https://content.storececotec.it/api/v3/doofinder/feed/?lang=it",
+        "DE": "https://storececotec.de/api/v3/doofinder/feed/?lang=de",
+    }
+    to_load = st.multiselect("Feeds a cargar", list(FEED_URLS.keys()), default=["ES"])
+    if st.button("Cargar feeds"):
+        for k in to_load:
+            with st.spinner(f"Cargando {k}…"):
+                feed_maps[k] = fetch_feed(FEED_URLS[k])
+                n = len(feed_maps[k])
+                if "__error__" in feed_maps[k]:
+                    st.warning(f"⚠️ {k}: {feed_maps[k]['__error__']}")
                 else:
-                    st.success(f"✅ {country}: {len(feed_maps[country])//2} productos")
+                    st.success(f"✅ {k}: {n//2} productos")
         st.session_state["feed_maps"] = feed_maps
 
-es_feed = feed_maps.get("Jabiru ES", {})
+es_feed = feed_maps.get("ES", {})
 
-# ─── Jabiru ES section (always shown) ─────────────────────────────────────────
-st.subheader(f"🇪🇸 Jabiru ES   ({jab_attrs['active_rows']:,} activos / {jab_attrs['total_rows']:,})")
+st.caption(f"Jabiru ES: **{jab_attrs['active']:,}** activos / {jab_attrs['total']:,} total  "
+           f"| PS referencias: **{len(refs):,}**")
+st.divider()
 
-df_jabiru_ps = check_ps(jab_active, refs)
-df_jabiru_mirror = check_mirror(j_bases, jab_skus, jab_map, "Jabiru ES")
+# ─── Comparativas ─────────────────────────────────────────────────────────────
+# 1. Prestashop vs Jabiru ES
+with st.expander("📦 **Prestashop ↔ Jabiru ES**  — referencias PS que faltan en Jabiru (y viceversa)", expanded=True):
+    ps_refs_upper = set(refs.str.strip().str.upper())
+    # PS refs que no tienen base en Jabiru active (en PS hay algo que no está en Amazon ES)
+    ps_bases_set = {extract_base(r).upper() for r in refs}
+    missing_in_jabiru = pd.DataFrame([
+        {"Referencia PS": r, "Base SKU": extract_base(r).upper()}
+        for r in refs
+        if extract_base(r).upper() not in {extract_base(s).upper() for s in jab_all["sku"]}
+    ])
+    # Jabiru active SKUs whose base is not in PS at all
+    missing_in_ps_from_jabiru = pd.DataFrame([
+        {"SKU Jabiru ES": sku, "Base SKU": b, "ASIN": asin}
+        for b, (sku, asin) in j_bases.items()
+        if b not in ps_refs_upper and f"S{b}" not in ps_refs_upper
+    ])
 
-country_section("jabiru", "Jabiru ES", "🇪🇸",
-                df_jabiru_ps, df_jabiru_mirror,
-                es_feed, 1.0, None,
-                show_es_template=True)
+    t1, t2 = st.tabs([
+        f"PS sin match en Jabiru ({len(missing_in_jabiru)})",
+        f"Jabiru sin match en PS ({len(missing_in_ps_from_jabiru)})"
+    ])
+    with t1:
+        st.caption("Referencias de Prestashop que no tienen ninguna variante activa en Jabiru ES.")
+        show_table(missing_in_jabiru, "ps_vs_jab", "ps_sin_jabiru.csv")
+    with t2:
+        st.caption("SKUs activos en Jabiru ES cuya base no aparece en Prestashop.")
+        show_table(missing_in_ps_from_jabiru, "jab_vs_ps", "jabiru_sin_ps.csv")
+        action_buttons(missing_in_ps_from_jabiru, "jab_vs_ps", "Jabiru→PS",
+                       es_feed, es_feed, 1.0, sql_lk, carga_lk,
+                       show_amz=False, show_ps=True)
 
 st.divider()
 
-# ─── Per-country sections ─────────────────────────────────────────────────────
-COUNTRY_META = {
-    "turaco": ("Turaco ES", "🇪🇸", "", 1.0, "EUR", True),
-    "fr":     ("FR",        "🇫🇷", "FR", 1.0, "EUR", False),
-    "it":     ("IT",        "🇮🇹", "IT", 1.0, "EUR", False),
-    "de":     ("DE",        "🇩🇪", "DE", 1.0, "EUR", False),
-    "nl":     ("NL",        "🇳🇱", "",   1.0, "EUR", False),
-    "se":     ("SE",        "🇸🇪", "",   None, "SEK", False),
-    "pl":     ("PL",        "🇵🇱", "",   None, "PLN", False),
+# 2. Comparativa por tienda: Jabiru ES vs cada store
+STORE_FEED = {
+    "jabiru_fr": ("FR", "FR", 1.0),
+    "jabiru_it": ("IT", "IT", 1.0),
+    "jabiru_de": ("DE", "DE", 1.0),
+    "jabiru_nl": ("DE", "",  1.0),
+    "jabiru_pl": ("DE", "",  st.session_state.get("rate_pln",4.25)),
+    "jabiru_se": ("DE", "",  st.session_state.get("rate_sek",11.5)),
+    "turaco_es": ("ES", "",  1.0),
+    "turaco_fr": ("FR", "FR",1.0),
+    "turaco_it": ("IT", "IT",1.0),
+    "turaco_de": ("DE", "DE",1.0),
 }
 
-for key, lbl in LISTING_DEFS:
-    if not listing_checks[key]:
+prefixes_by_key = {k: STORE_CONFIG[k][2] for k in STORE_CONFIG}
+
+for key, lbl, flag in OTHER_STORES:
+    if not store_enabled[key]:
         continue
-    f = listing_files[key]
-    label, flag, prefix, rate_fixed, currency, is_es = COUNTRY_META[key]
-    rate = (st.session_state.get("rate_sek", 11.5) if currency == "SEK"
-            else st.session_state.get("rate_pln", 4.25) if currency == "PLN"
-            else 1.0)
+    f = store_files[key]
+    label = lbl
+    prefixes = prefixes_by_key[key]  # e.g. ["","S"] or ["","S","FR"]
+    feed_key, _, rate = STORE_FEED[key]
+    country_feed = feed_maps.get(feed_key, {})
 
-    cfg_key = label  # matches COUNTRIES dict key
-    country_feed = feed_maps.get(cfg_key, {})
-    fallback = es_feed if country_feed is not es_feed else None
+    with st.expander(f"{flag} **Jabiru ES → {label}**", expanded=True):
+        if f is None:
+            st.info(f"Sube el listing de {label} para analizar.")
+            continue
+        with st.spinner(f"Leyendo {label}…"):
+            _, store_all, store_attrs = parse_listing(f.read(), label)
+        store_skus = sku_set(store_all)
 
-    if f is None:
-        st.info(f"{flag} **{label}** — activa el checkbox y sube el fichero para procesar.")
-        st.divider()
-        continue
+        df_miss = missing_variants(j_bases, store_skus, prefixes)
+        st.caption(f"{label}: **{store_attrs['active']:,}** activos / {store_attrs['total']:,} total")
 
-    with st.spinner(f"Leyendo {label}…"):
-        c_active, c_all, c_attrs = parse_listing(f.read(), label)
+        n_ok   = len(j_bases) - len(df_miss)
+        n_miss = len(df_miss)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Bases Jabiru ES",  len(j_bases))
+        c2.metric("✅ Con todas variantes", n_ok)
+        c3.metric("❌ Con variantes faltantes", n_miss)
 
-    c_skus = set(c_all["sku"])
-    c_map  = sku_map(c_all)
+        show_table(df_miss, f"miss_{key}", f"faltantes_{key}.csv")
+        if not df_miss.empty:
+            action_buttons(df_miss, key, label,
+                           country_feed, es_feed, rate,
+                           sql_lk, carga_lk,
+                           show_amz=(key in ("turaco_es",)),
+                           show_ps=True)
 
-    df_c1 = check_missing(j_bases, c_skus, prefix)
-    df_c2 = check_mirror(j_bases, c_skus, c_map, label)
-
-    active_n = c_attrs["active_rows"]
-    total_n  = c_attrs["total_rows"]
-    st.subheader(f"{flag} {label}   ({active_n:,} activos / {total_n:,})")
-
-    country_section(key, label, flag, df_c1, df_c2,
-                    country_feed, rate, fallback, is_es)
     st.divider()
 
-# ─── Global export ────────────────────────────────────────────────────────────
-if st.button("📥 Exportar resumen Excel completo"):
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        df_jabiru_ps.to_excel(w,     sheet_name="Jabiru_sin_PS",    index=False)
-        df_jabiru_mirror.to_excel(w, sheet_name="Espejos_Jabiru",   index=False)
-    st.download_button("⬇️ Descargar Excel",
-                       data=buf.getvalue(),
-                       file_name="sku_crossref_resumen.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                       key="dl_global_excel")
+# 3. Espejos vs Prestashop
+with st.expander("🔁 **Todos los espejos → Prestashop**  — variantes S+SKU / XX+SKU ausentes en PS", expanded=False):
+    st.caption("Comprueba que Prestashop tiene creadas TODAS las referencias que existen en cualquier tienda Amazon.")
+    df_ps_full = ps_missing(j_bases, {}, refs)
+    m1, m2 = st.columns(2)
+    m1.metric("Total variantes a comprobar", len(j_bases) * 6)  # base+S+FR+IT+DE ~ 5-6
+    m2.metric("❌ Ausentes en PS", len(df_ps_full))
+    show_table(df_ps_full, "ps_full", "faltantes_ps_completo.csv")
+    if not df_ps_full.empty:
+        action_buttons(df_ps_full, "ps_full", "PS completo",
+                       es_feed, es_feed, 1.0, sql_lk, carga_lk,
+                       show_amz=False, show_ps=True)
