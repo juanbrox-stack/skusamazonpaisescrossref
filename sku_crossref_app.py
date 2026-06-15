@@ -226,23 +226,59 @@ def gen_ps_csv(df_missing: pd.DataFrame, sql_lk, carga_lk) -> bytes:
     return buf.getvalue()
 
 # ─── Amazon template ──────────────────────────────────────────────────────────
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_feed(url: str) -> dict:
+@st.cache_data(show_spinner=False)
+def parse_feed_file(data: bytes, label: str) -> dict:
+    """
+    Parse a Cecotec feed file (JSON or CSV/TSV) uploaded by the user.
+    Extracts {mpn_upper: price_str} mapping.
+    Supports:
+      - JSON feed from /api/v3/doofinder/feed/  (save URL as .json in browser)
+      - CSV/TSV with columns: mpn/reference/sku + price/sale_price
+    """
+    import json as _json
+    m = {}
+
+    def _add(mpn, price):
+        mpn = str(mpn).strip().upper()
+        price = str(price).strip()
+        if mpn and price and price not in ("", "0", "0.0", "nan"):
+            m[mpn] = price
+            stripped = mpn.lstrip("0") or "0"
+            if stripped != mpn:
+                m[stripped] = price
+
+    # Try JSON first
     try:
-        r = requests.get(url, timeout=20, headers={"User-Agent":"Mozilla/5.0"})
-        r.raise_for_status()
-        data = r.json()
-        items = data if isinstance(data,list) else data.get("items",data.get("results",data.get("products",[])))
-        m = {}
+        text = data.decode("utf-8", errors="replace").strip()
+        data_j = _json.loads(text)
+        items = data_j if isinstance(data_j, list) else data_j.get(
+            "items", data_j.get("results", data_j.get("products", [])))
         for item in items:
-            mpn = str(item.get("mpn", item.get("reference",""))).strip().upper()
-            price = str(item.get("price", item.get("sale_price","")))
-            if mpn and price:
-                m[mpn] = price
-                m[mpn.lstrip("0") or "0"] = price
-        return m
+            mpn   = item.get("mpn") or item.get("reference") or item.get("id","")
+            price = item.get("price") or item.get("sale_price","")
+            _add(mpn, price)
+        if m:
+            return m
+    except Exception:
+        pass  # not JSON, try CSV
+
+    # Try CSV/TSV
+    try:
+        sep = "	" if b"	" in data[:500] else ","
+        df = pd.read_csv(io.BytesIO(data), sep=sep, dtype=str, low_memory=False,
+                         encoding="utf-8-sig", on_bad_lines="skip")
+        df.columns = [c.strip().lower() for c in df.columns]
+        mpn_col   = next((c for c in df.columns if c in ("mpn","reference","sku","ref")), None)
+        price_col = next((c for c in df.columns if c in ("price","sale_price","precio","pvp")), None)
+        if mpn_col and price_col:
+            for _, row in df.iterrows():
+                _add(row[mpn_col], row[price_col])
     except Exception as e:
-        return {"__error__": str(e)}
+        return {"__error__": f"No se pudo leer el fichero de feed {label}: {e}"}
+
+    if not m:
+        return {"__error__": f"Feed {label}: no se encontraron productos (comprueba columnas mpn/reference y price)"}
+    return m
 
 def get_price(base: str, feed: dict, es_feed: dict) -> str:
     def _look(m, b):
@@ -420,26 +456,33 @@ sql_lk, carga_lk = build_ps_lookups(
     st.session_state.get("ps_carga_bytes")
 )
 
-# Feeds
+# Feeds — upload-based (URL fetch blocked by Streamlit Cloud network policy)
 feed_maps = st.session_state.get("feed_maps", {})
-with st.expander("🌐 Precios desde feeds Cecotec (opcional)"):
-    FEED_URLS = {
-        "ES": "https://cecotec.es/api/v3/doofinder/feed/?lang=es",
-        "FR": "https://storececotec.fr/api/v3/doofinder/feed/?lang=fr",
-        "IT": "https://content.storececotec.it/api/v3/doofinder/feed/?lang=it",
-        "DE": "https://storececotec.de/api/v3/doofinder/feed/?lang=de",
-    }
-    to_load = st.multiselect("Feeds a cargar", list(FEED_URLS.keys()), default=["ES"])
-    if st.button("Cargar feeds"):
-        for k in to_load:
-            with st.spinner(f"Cargando {k}…"):
-                feed_maps[k] = fetch_feed(FEED_URLS[k])
-                n = len(feed_maps[k])
-                if "__error__" in feed_maps[k]:
-                    st.warning(f"⚠️ {k}: {feed_maps[k]['__error__']}")
+with st.expander("💶 Precios desde feeds Cecotec (opcional)"):
+    st.caption(
+        "Descarga cada feed en tu navegador y súbelo aquí. URLs de descarga:\n"
+        "- **ES**: https://cecotec.es/api/v3/doofinder/feed/?lang=es  \n"
+        "- **FR**: https://storececotec.fr/api/v3/doofinder/feed/?lang=fr  \n"
+        "- **IT**: https://content.storececotec.it/api/v3/doofinder/feed/?lang=it  \n"
+        "- **DE**: https://storececotec.de/api/v3/doofinder/feed/?lang=de  \n"
+        "Guarda cada URL como archivo (.json, .csv o .txt) y súbelo abajo."
+    )
+    FEED_LABELS = {"ES": "🇪🇸 Feed ES", "FR": "🇫🇷 Feed FR",
+                   "IT": "🇮🇹 Feed IT", "DE": "🇩🇪 Feed DE"}
+    cols = st.columns(4)
+    for i, (k, lbl) in enumerate(FEED_LABELS.items()):
+        with cols[i]:
+            uf = st.file_uploader(lbl, type=["json","csv","txt","tsv"], key=f"feed_file_{k}")
+            if uf:
+                feed_data = parse_feed_file(uf.read(), k)
+                if "__error__" in feed_data:
+                    st.warning(feed_data["__error__"])
                 else:
-                    st.success(f"✅ {k}: {n//2} productos")
-        st.session_state["feed_maps"] = feed_maps
+                    feed_maps[k] = feed_data
+                    st.session_state["feed_maps"] = feed_maps
+                    st.success(f"✅ {len(feed_data)//2} productos")
+            elif k in feed_maps:
+                st.caption(f"✅ {len(feed_maps[k])//2} cargados")
 
 es_feed = feed_maps.get("ES", {})
 
