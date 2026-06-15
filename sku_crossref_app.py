@@ -28,7 +28,7 @@ with st.sidebar:
 - 🇫🇷/🇮🇹/🇩🇪: bases de Jabiru sin variante activa en ese país
 
 **Cruce 2 – Espejos S+SKU faltantes**
-- Cada SKU base debe tener su `S+SKU` en ES (Jabiru y Turaco) y en FR, IT, DE
+- Cada SKU base debe tener su `S+SKU` creado (cualquier estado) en ES (Jabiru y Turaco) y en FR, IT, DE
 """)
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -172,8 +172,8 @@ def check_mirror(j_bases: dict,
                  listing_map: dict,
                  store_label: str) -> pd.DataFrame:
     """
-    Para cada base activa de Jabiru, verifica que S+base exista en el listing.
-    Devuelve filas donde S+base falta.
+    Para cada base activa de Jabiru, verifica que S+base exista en el listing (cualquier estado).
+    Devuelve filas donde S+base NO está creado en absoluto.
     """
     rows = []
     for base, (sku_j, asin_base) in j_bases.items():
@@ -221,23 +221,19 @@ with st.sidebar:
         st.caption(f"{flag}: **{active:,}** activos / {total:,} total ({pct})")
 
 with st.spinner("Calculando cruces…"):
-    # Cruce 1: ¿existe el SKU en el país? -> todos los estados
-    jabiru_skus_active = set(jabiru_active["sku"])
+    # Todos los estados: para ambos cruces (un SKU existe si aparece en cualquier estado)
+    jabiru_skus_active = set(jabiru_active["sku"])   # Jabiru siempre solo Active
+    jabiru_skus_all    = jabiru_skus_active           # Jabiru: Active = All (ya filtrado)
     turaco_skus_all    = set(turaco_all["sku"])
     fr_skus_all        = set(fr_all["sku"])
     it_skus_all        = set(it_all["sku"])
     de_skus_all        = set(de_all["sku"])
-    # Cruce 2: ¿el espejo S+SKU está activo? -> solo Active
-    turaco_skus_active = set(turaco_active["sku"])
-    fr_skus_active     = set(fr_active["sku"])
-    it_skus_active     = set(it_active["sku"])
-    de_skus_active     = set(de_active["sku"])
 
     jabiru_map = build_sku_map(jabiru_active)
-    turaco_map = build_sku_map(turaco_active)
-    fr_map     = build_sku_map(fr_active)
-    it_map     = build_sku_map(it_active)
-    de_map     = build_sku_map(de_active)
+    turaco_map = build_sku_map(turaco_all)
+    fr_map     = build_sku_map(fr_all)
+    it_map     = build_sku_map(it_all)
+    de_map     = build_sku_map(de_all)
 
     # Fuente de verdad: bases únicas activas de Jabiru
     j_bases = jabiru_bases_map(jabiru_active)
@@ -249,12 +245,12 @@ with st.spinner("Calculando cruces…"):
     df_it_missing     = check_country(j_bases, it_skus_all,  "IT")
     df_de_missing     = check_country(j_bases, de_skus_all,  "DE")
 
-    # ── Cruce 2: espejos S+SKU (busca solo en Active) ─────────────────────────
-    df_mirror_jabiru  = check_mirror(j_bases, jabiru_skus_active, jabiru_map, "Jabiru ES")
-    df_mirror_turaco  = check_mirror(j_bases, turaco_skus_active, turaco_map, "Turaco ES")
-    df_mirror_fr      = check_mirror(j_bases, fr_skus_active,     fr_map,     "FR")
-    df_mirror_it      = check_mirror(j_bases, it_skus_active,     it_map,     "IT")
-    df_mirror_de      = check_mirror(j_bases, de_skus_active,     de_map,     "DE")
+    # ── Cruce 2: espejos S+SKU (busca en TODOS los estados — existe = creado) ────
+    df_mirror_jabiru  = check_mirror(j_bases, jabiru_skus_all, jabiru_map, "Jabiru ES")
+    df_mirror_turaco  = check_mirror(j_bases, turaco_skus_all, turaco_map, "Turaco ES")
+    df_mirror_fr      = check_mirror(j_bases, fr_skus_all,     fr_map,     "FR")
+    df_mirror_it      = check_mirror(j_bases, it_skus_all,     it_map,     "IT")
+    df_mirror_de      = check_mirror(j_bases, de_skus_all,     de_map,     "DE")
 
     # Resumen unificado de espejos (todas las tiendas)
     df_mirror_all = pd.concat(
