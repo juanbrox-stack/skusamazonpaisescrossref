@@ -77,15 +77,16 @@ def parse_ps(data: bytes) -> pd.Series:
 def sku_set(df): return set(df["sku"].str.upper().dropna())
 def sku_map(df): return df.drop_duplicates("sku").set_index("sku")["asin"].to_dict()
 
+@st.cache_data(show_spinner=False)
 def jabiru_bases(jdf: pd.DataFrame) -> dict:
-    """Extract unique bases from Jabiru ES active SKUs. Ignores AMZN.* auto-SKUs."""
-    result = {}
-    for _, row in jdf.iterrows():
-        if AMZN_AUTO.match(row["sku"]): continue
-        b = extract_base(row["sku"]).upper()
-        if b not in result:
-            result[b] = (row["sku"], row["asin"])
-    return result
+    """Extract unique bases from Jabiru ES active SKUs. Ignores AMZN.* auto-SKUs. Vectorized."""
+    skus = jdf["sku"]
+    mask = ~skus.str.match(r"^AMZN\.", case=False, na=False)
+    sub = jdf[mask].copy()
+    sub["base"] = sub["sku"].map(extract_base).str.upper()
+    # Keep first occurrence per base (drop_duplicates preserves order)
+    sub = sub.drop_duplicates("base", keep="first")
+    return dict(zip(sub["base"], zip(sub["sku"], sub["asin"])))
 
 # ─── Cross-check functions ────────────────────────────────────────────────────
 def missing_variants(j_bases: dict, target_skus: set, prefixes: list) -> pd.DataFrame:
