@@ -365,7 +365,7 @@ def show_table(df: pd.DataFrame, dl_key: str, dl_name: str, df_detail: pd.DataFr
     st.dataframe(filt, width="stretch", height=380)
 
     if df_detail is not None:
-        # Two downloads: summary (one row per base) and detail (one row per missing SKU)
+        # Two downloads: summary CSV (1 row/base) and detail XLSX (1 row/missing SKU)
         c1, c2 = st.columns(2)
         c1.download_button("⬇️ CSV resumen (1 fila/base)",
                            filt.to_csv(index=False).encode("utf-8-sig"),
@@ -374,11 +374,14 @@ def show_table(df: pd.DataFrame, dl_key: str, dl_name: str, df_detail: pd.DataFr
         bases_shown = set(filt["Base SKU"]) if "Base SKU" in filt.columns else None
         detail_filt = (df_detail[df_detail["Base SKU"].isin(bases_shown)]
                        if bases_shown is not None else df_detail)
+        xlsx_buf = io.BytesIO()
+        detail_filt.to_excel(xlsx_buf, index=False, engine="openpyxl")
         c2.download_button(
-            f"⬇️ CSV detalle (1 fila/SKU faltante — {len(detail_filt):,} filas)",
-            detail_filt.to_csv(index=False).encode("utf-8-sig"),
-            file_name=dl_name.replace(".csv", "_detalle.csv"),
-            mime="text/csv", key=f"dl_detail_{dl_key}")
+            f"⬇️ XLSX detalle (1 fila/SKU faltante — {len(detail_filt):,} filas)",
+            xlsx_buf.getvalue(),
+            file_name=dl_name.replace(".csv", "_detalle.xlsx"),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"dl_detail_{dl_key}")
     else:
         st.download_button("⬇️ CSV", filt.to_csv(index=False).encode("utf-8-sig"),
                            file_name=dl_name, mime="text/csv", key=f"dl_{dl_key}")
