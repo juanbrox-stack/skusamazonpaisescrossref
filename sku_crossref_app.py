@@ -75,6 +75,21 @@ def parse_ps(data: bytes) -> pd.Series:
     return s[s != ""]
 
 def sku_set(df): return set(df["sku"].str.upper().dropna())
+
+def read_once(uploaded_file, cache_key: str) -> bytes:
+    """
+    Read an UploadedFile's bytes only once per file (avoids re-reading
+    megabytes from the stream on every Streamlit rerun).
+    """
+    if uploaded_file is None:
+        return None
+    sig = (uploaded_file.name, uploaded_file.size)
+    cached = st.session_state.get(cache_key)
+    if cached and cached[0] == sig:
+        return cached[1]
+    data = uploaded_file.read()
+    st.session_state[cache_key] = (sig, data)
+    return data
 def sku_map(df): return df.drop_duplicates("sku").set_index("sku")["asin"].to_dict()
 
 @st.cache_data(show_spinner=False)
@@ -91,17 +106,12 @@ def jabiru_bases(jdf: pd.DataFrame) -> dict:
 # ─── Cross-check functions ────────────────────────────────────────────────────
 def missing_variants(j_bases: dict, target_skus: set, prefixes: list) -> pd.DataFrame:
     """
-    For each Jabiru ES base, checks that ALL required prefix variants exist in target.
-    Returns rows where at least one required variant is missing.
-    prefixes: list of prefixes to check, e.g. ["", "S"] or ["", "S", "FR"]
+    Summary view: one row per Jabiru ES base with at least one missing variant.
+    Used for the on-screen table / metrics. Faltantes column lists missing SKUs joined by '|'.
     """
     rows = []
     for base, (sku_j, asin) in j_bases.items():
-        missing = []
-        for pfx in prefixes:
-            variant = f"{pfx}{base}"
-            if variant not in target_skus:
-                missing.append(variant)
+        missing = [f"{pfx}{base}" for pfx in prefixes if f"{pfx}{base}" not in target_skus]
         if missing:
             all_variants = [f"{p}{base}" for p in prefixes]
             rows.append({
@@ -111,6 +121,29 @@ def missing_variants(j_bases: dict, target_skus: set, prefixes: list) -> pd.Data
                 "Faltantes":        " | ".join(missing),
                 "Variantes req.":   " | ".join(all_variants),
             })
+    return pd.DataFrame(rows)
+
+def missing_variants_long(j_bases: dict, target_skus: set, prefixes: list,
+                          store_label: str = "") -> pd.DataFrame:
+    """
+    Detail view for download: ONE ROW PER MISSING SKU/espejo.
+    Same ASIN repeated on every row (the ASIN belongs to the base product in Jabiru ES,
+    since the missing variant doesn't exist yet in the target store).
+    Columns: Tienda, SKU Jabiru ES, Base SKU, SKU faltante, Prefijo, ASIN
+    """
+    rows = []
+    for base, (sku_j, asin) in j_bases.items():
+        for pfx in prefixes:
+            variant = f"{pfx}{base}"
+            if variant not in target_skus:
+                rows.append({
+                    "Tienda":         store_label,
+                    "SKU Jabiru ES":  sku_j,
+                    "Base SKU":       base,
+                    "SKU faltante":   variant,
+                    "Prefijo":        pfx if pfx else "(sin prefijo)",
+                    "ASIN":           asin,
+                })
     return pd.DataFrame(rows)
 
 def ps_missing(j_bases: dict, turaco_sets: dict, ps_refs: pd.Series) -> pd.DataFrame:
@@ -317,7 +350,7 @@ def gen_amz_template(df: pd.DataFrame, feed: dict, es_feed: dict, rate: float) -
     return buf.getvalue()
 
 # ─── UI helpers ───────────────────────────────────────────────────────────────
-def show_table(df: pd.DataFrame, dl_key: str, dl_name: str):
+def show_table(df: pd.DataFrame, dl_key: str, dl_name: str, df_detail: pd.DataFrame = None):
     if df.empty:
         st.success("✅ Sin diferencias.")
         return
@@ -330,8 +363,25 @@ def show_table(df: pd.DataFrame, dl_key: str, dl_name: str):
             mask |= df[c].astype(str).str.contains(q, case=False, na=False)
         filt = df[mask]
     st.dataframe(filt, width="stretch", height=380)
-    st.download_button("⬇️ CSV", filt.to_csv(index=False).encode("utf-8-sig"),
-                       file_name=dl_name, mime="text/csv", key=f"dl_{dl_key}")
+
+    if df_detail is not None:
+        # Two downloads: summary (one row per base) and detail (one row per missing SKU)
+        c1, c2 = st.columns(2)
+        c1.download_button("⬇️ CSV resumen (1 fila/base)",
+                           filt.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=dl_name, mime="text/csv", key=f"dl_{dl_key}")
+        # Filter detail to the same bases shown in the (possibly filtered) summary
+        bases_shown = set(filt["Base SKU"]) if "Base SKU" in filt.columns else None
+        detail_filt = (df_detail[df_detail["Base SKU"].isin(bases_shown)]
+                       if bases_shown is not None else df_detail)
+        c2.download_button(
+            f"⬇️ CSV detalle (1 fila/SKU faltante — {len(detail_filt):,} filas)",
+            detail_filt.to_csv(index=False).encode("utf-8-sig"),
+            file_name=dl_name.replace(".csv", "_detalle.csv"),
+            mime="text/csv", key=f"dl_detail_{dl_key}")
+    else:
+        st.download_button("⬇️ CSV", filt.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=dl_name, mime="text/csv", key=f"dl_{dl_key}")
 
 def action_buttons(df: pd.DataFrame, dl_key: str, label: str,
                    feed: dict, es_feed: dict, rate: float,
@@ -443,11 +493,12 @@ if not ps_file or not jabiru_file:
     st.stop()
 
 # ─── Load base data ───────────────────────────────────────────────────────────
-ps_raw = ps_file.read()
+ps_raw = read_once(ps_file, "_cache_ps")
 st.session_state["ps_bytes_raw"] = ps_raw
 refs = parse_ps(ps_raw)
 
-jab_active, jab_all, jab_attrs = parse_listing(jabiru_file.read(), "Jabiru ES")
+jab_raw = read_once(jabiru_file, "_cache_jabiru")
+jab_active, jab_all, jab_attrs = parse_listing(jab_raw, "Jabiru ES")
 j_bases = jabiru_bases(jab_active)
 jab_skus = sku_set(jab_all)
 
@@ -555,10 +606,12 @@ for key, lbl, flag in OTHER_STORES:
             st.info(f"Sube el listing de {label} para analizar.")
             continue
         with st.spinner(f"Leyendo {label}…"):
-            _, store_all, store_attrs = parse_listing(f.read(), label)
+            store_raw = read_once(f, f"_cache_store_{key}")
+            _, store_all, store_attrs = parse_listing(store_raw, label)
         store_skus = sku_set(store_all)
 
         df_miss = missing_variants(j_bases, store_skus, prefixes)
+        df_miss_detail = missing_variants_long(j_bases, store_skus, prefixes, store_label=label)
         st.caption(f"{label}: **{store_attrs['active']:,}** activos / {store_attrs['total']:,} total")
 
         n_ok   = len(j_bases) - len(df_miss)
@@ -568,7 +621,7 @@ for key, lbl, flag in OTHER_STORES:
         c2.metric("✅ Con todas variantes", n_ok)
         c3.metric("❌ Con variantes faltantes", n_miss)
 
-        show_table(df_miss, f"miss_{key}", f"faltantes_{key}.csv")
+        show_table(df_miss, f"miss_{key}", f"faltantes_{key}.csv", df_detail=df_miss_detail)
         if not df_miss.empty:
             action_buttons(df_miss, key, label,
                            country_feed, es_feed, rate,
