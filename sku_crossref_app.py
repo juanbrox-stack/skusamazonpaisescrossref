@@ -102,11 +102,23 @@ def prefix_sort_key(p: str) -> tuple:
     return (PREFIX_ORDER.get(p, 2), p)
 
 def build_excel(df: pd.DataFrame) -> bytes:
-    df = df.copy()
-    df["_ord"] = df["Prefijo"].map(prefix_sort_key)
-    df = df.sort_values(["Base SKU", "_ord"]).drop(columns="_ord")
+    """
+    One sheet per prefix type: 'Sin prefijo', 'S', and one per country prefix (FR, IT, DE...).
+    Each sheet sorted by Base SKU. Keeps prefixes separated so Amazon's "first match" upload
+    behavior doesn't accidentally pick an S+SKU or wrong-country row.
+    """
     buf = io.BytesIO()
-    df.to_excel(buf, index=False, engine="openpyxl")
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        # Determine sheet order: sin prefijo -> S -> rest alphabetically
+        prefixes_present = list(df["Prefijo"].unique())
+        def _key(p):
+            return (0 if p == "(sin prefijo)" else 1 if p == "S" else 2, p)
+        prefixes_present.sort(key=_key)
+
+        for pfx in prefixes_present:
+            sheet_name = "Sin_prefijo" if pfx == "(sin prefijo)" else pfx
+            sub = df[df["Prefijo"] == pfx].sort_values("Base SKU").drop(columns="Prefijo")
+            sub.to_excel(writer, sheet_name=sheet_name[:31], index=False)
     return buf.getvalue()
 
 # ═══════════════════════════════════════════════════════════════════════════════
